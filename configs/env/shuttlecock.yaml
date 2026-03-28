@@ -1,0 +1,6 @@
+﻿proxy_shape: sphere
+mass_kg: 0.005
+radius_m: 0.03
+aero:
+  drag_length_L: 4.1
+  drag_scale: 1.0

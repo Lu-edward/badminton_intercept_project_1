@@ -1,0 +1,19 @@
+﻿env_name: intercept
+num_envs: 1024
+sim_dt: 0.005
+episode_length_s: 3.0
+arena:
+  court_length: 13.4
+  court_width: 6.1
+  net_height: 1.55
+net:
+  thickness_m: 0.05
+  width_m: 6.5
+ground:
+  restitution: 0.1
+termination:
+  out_of_bounds: true
+  timeout: true
+  hit_success: true
+randomization:
+  enabled: true

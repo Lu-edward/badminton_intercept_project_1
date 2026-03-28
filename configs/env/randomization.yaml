@@ -1,0 +1,10 @@
+﻿enabled: true
+racket:
+  restitution_range: [0.75, 0.90]
+shuttlecock:
+  mass_range: [0.0045, 0.0055]
+  drag_length_range: [3.8, 4.4]
+drone:
+  mass_scale_range: [0.95, 1.05]
+  inertia_scale_range: [0.95, 1.05]
+  thrust_coeff_scale_range: [0.95, 1.05]

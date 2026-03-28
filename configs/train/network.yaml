@@ -1,0 +1,7 @@
+﻿actor:
+  hidden_sizes: [256, 256, 128]
+  activation: elu
+critic:
+  hidden_sizes: [256, 256, 128]
+  activation: elu
+asymmetric: true
