@@ -167,6 +167,7 @@ if ISAACLAB_CFG_AVAILABLE:
         dr_quad_inertia_scale_range: tuple[float, float] = (0.95, 1.05)
         dr_thrust_coeff_scale_range: tuple[float, float] = (0.95, 1.05)
         arena: ArenaCfg = field(default_factory=ArenaCfg)
+        enable_post_hit_tracking: bool = False
 
 else:
 
@@ -258,6 +259,7 @@ else:
         dr_thrust_coeff_scale_range: tuple[float, float] = (0.95, 1.05)
         arena: ArenaCfg = field(default_factory=ArenaCfg)
         randomization_enabled: bool = True
+        enable_post_hit_tracking: bool = False
 
 
 DEFAULT_ENV_CFG = InterceptEnvCfg()

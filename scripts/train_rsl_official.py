@@ -42,6 +42,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--curriculum_stage_id", type=int, default=None, help="1-based curriculum stage id to start from, e.g. 2 for stage2.")
     parser.add_argument("--init_curriculum_stage", type=int, default=None, help="Deprecated 0-based alias: 0=stage1, 1=stage2, 2=stage3.")
     parser.add_argument("--freeze_curriculum_stage", action="store_true", default=False, help="Keep training fixed at the selected curriculum stage without auto-promotion.")
+    parser.add_argument("--enable_post_hit_tracking", action="store_true", default=False, help="Enable post-hit tracking mode for task 2")
     parser.add_argument("--wandb", action="store_true", default=False, help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="badminton_intercept", help="Wandb project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team/username)")
@@ -139,12 +140,38 @@ def _extract_model_state_dict(checkpoint_payload: dict[str, Any]) -> dict[str, A
 
     if "actor_state_dict" in checkpoint_payload and "critic_state_dict" in checkpoint_payload:
         model_state_dict: dict[str, Any] = {}
-        for prefix, sub_state in (
-            ("actor", checkpoint_payload["actor_state_dict"]),
-            ("critic", checkpoint_payload["critic_state_dict"]),
-        ):
-            for key, value in sub_state.items():
-                model_state_dict[key if key.startswith(f"{prefix}.") else f"{prefix}.{key}"] = value
+        
+        actor_state = checkpoint_payload["actor_state_dict"]
+        critic_state = checkpoint_payload["critic_state_dict"]
+        
+        actor_keys = list(actor_state.keys())
+        if actor_keys and any(k.startswith("mlp.") for k in actor_keys):
+            for key, value in actor_state.items():
+                if key.startswith("mlp."):
+                    model_state_dict[key] = value
+                elif key.startswith("obs_normalizer."):
+                    model_state_dict[key] = value
+                elif key == "distribution.log_std_param":
+                    model_state_dict["log_std"] = value
+                else:
+                    model_state_dict[key] = value
+        else:
+            for key, value in actor_state.items():
+                model_state_dict[key if key.startswith("actor.") else f"actor.{key}"] = value
+        
+        critic_keys = list(critic_state.keys())
+        if critic_keys and any(k.startswith("mlp.") for k in critic_keys):
+            for key, value in critic_state.items():
+                if key.startswith("mlp."):
+                    model_state_dict[key] = value
+                elif key.startswith("obs_normalizer."):
+                    model_state_dict[key] = value
+                else:
+                    model_state_dict[key] = value
+        else:
+            for key, value in critic_state.items():
+                model_state_dict[key if key.startswith("critic.") else f"critic.{key}"] = value
+        
         if "actor_obs_normalizer_state_dict" in checkpoint_payload:
             for key, value in checkpoint_payload["actor_obs_normalizer_state_dict"].items():
                 model_state_dict[f"actor_obs_normalizer.{key}"] = value
@@ -226,9 +253,21 @@ def _get_policy_action_std_mean(policy) -> float:
 
 
 def _load_finetune_checkpoint(runner: OnPolicyRunner, checkpoint_path: str) -> None:
+    """Load checkpoint for finetuning - loads actor and critic weights without optimizer/iteration."""
     checkpoint_payload = torch.load(checkpoint_path, weights_only=False, map_location=runner.device)
-    model_state_dict = _extract_model_state_dict(checkpoint_payload)
-    _get_runner_policy(runner).load_state_dict(model_state_dict, strict=True)
+    
+    # rsl-rl 5.0+ 使用 alg.actor 和 alg.critic 分别加载
+    if hasattr(runner, 'alg') and hasattr(runner.alg, 'actor') and hasattr(runner.alg, 'critic'):
+        if "actor_state_dict" in checkpoint_payload:
+            runner.alg.actor.load_state_dict(checkpoint_payload["actor_state_dict"], strict=True)
+            print(f"[INFO] Loaded actor weights from: {checkpoint_path}")
+        if "critic_state_dict" in checkpoint_payload:
+            runner.alg.critic.load_state_dict(checkpoint_payload["critic_state_dict"], strict=True)
+            print(f"[INFO] Loaded critic weights from: {checkpoint_path}")
+    else:
+        # 回退到旧版本的方式
+        model_state_dict = _extract_model_state_dict(checkpoint_payload)
+        _get_runner_policy(runner).load_state_dict(model_state_dict, strict=True)
 
 
 def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
@@ -447,6 +486,11 @@ def main() -> None:
         env_cfg.curriculum_initial_stage_id = requested_stage_id
     env_cfg.curriculum_fixed_stage = bool(args_cli.freeze_curriculum_stage)
 
+    if args_cli.enable_post_hit_tracking:
+        env_cfg.enable_post_hit_tracking = True
+        env_cfg.curriculum_initial_stage_id = 3
+        env_cfg.curriculum_fixed_stage = True
+
     runner_cfg = BadmintonInterceptPPORunnerCfg()
     runner_cfg.max_iterations = args_cli.max_iterations
     runner_cfg.seed = args_cli.seed
@@ -474,14 +518,18 @@ def main() -> None:
     if args_cli.desired_kl is not None:
         runner_cfg.algorithm.desired_kl = args_cli.desired_kl
 
+    if args_cli.enable_post_hit_tracking:
+        if args_cli.policy_init_noise_std is None:
+            runner_cfg.policy.init_noise_std = 0.3
+        if args_cli.learning_rate is None:
+            runner_cfg.algorithm.learning_rate = 1e-4
+
     if checkpoint_mode == "resume":
         runner_cfg.resume = True
     if args_cli.load_run is not None:
         runner_cfg.load_run = args_cli.load_run
     if args_cli.load_checkpoint is not None:
         runner_cfg.load_checkpoint = args_cli.load_checkpoint
-
-    handle_deprecated_rsl_rl_cfg(runner_cfg, "5.0.1")
 
     if args_cli.wandb:
         wandb.init(
@@ -531,7 +579,10 @@ def main() -> None:
             resume_path = _resolve_checkpoint_path(log_root, args_cli.load_run, args_cli.load_checkpoint)
 
     env = RslRlVecEnvWrapper(env, clip_actions=runner_cfg.clip_actions)
-    runner = OnPolicyRunner(env, runner_cfg.to_dict(), log_dir=log_dir, device=runner_cfg.device)
+    # 处理rsl-rl版本兼容性 - 必须在to_dict()之前调用，因为函数需要操作配置对象的属性
+    handle_deprecated_rsl_rl_cfg(runner_cfg, "5.0.1")
+    runner_cfg_dict = runner_cfg.to_dict()
+    runner = OnPolicyRunner(env, runner_cfg_dict, log_dir=log_dir, device=runner_cfg.device)
 
     if checkpoint_mode == "resume" and resume_path is not None:
         print(f"[INFO] Resuming runner from checkpoint: {resume_path}")

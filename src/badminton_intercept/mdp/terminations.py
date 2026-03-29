@@ -6,6 +6,117 @@ except Exception:
     torch = None
 
 
+def compute_dones_task2(
+    ball_pos_w=None,
+    net_contact=None,
+    z_threshold: float = 0.1,
+    max_ball_height: float = 7.0,
+    court_bounds: dict | None = None,
+    return_reason_masks: bool = False,
+):
+    """Compute termination signals and rewards for Task 2.
+
+    Task 2 termination conditions:
+    1. Ball touches the net
+    2. Ball touches the ground (drone half x>0 or server half x<0)
+    3. Ball goes out of bounds (both halves)
+    4. Ball height exceeds 7m
+
+    Reward rules:
+    - Net contact: 0
+    - Drone half ground: 0
+    - Drone half out of bounds: 0
+    - Server half out of bounds: +10
+    - Server half ground: +70
+    - Ball height > 7m: 0
+
+    Args:
+        ball_pos_w: Ball position in world frame, shape (N, 3)
+        net_contact: Boolean tensor for net contact, shape (N,)
+        z_threshold: Ground threshold for ball grounded detection
+        max_ball_height: Maximum allowed ball height (default 7.0m)
+        court_bounds: Dict with 'x' and 'y' bounds, e.g., {'x': (-6.7, 6.7), 'y': (-3.05, 3.05)}
+        return_reason_masks: If True, return reason masks dict
+
+    Returns:
+        If return_reason_masks is False:
+            terminated: Boolean tensor of termination flags
+            rewards: Float tensor of rewards for each environment
+        If return_reason_masks is True:
+            terminated: Boolean tensor of termination flags
+            rewards: Float tensor of rewards for each environment
+            reason_masks: Dict of reason masks and reward masks
+    """
+    if torch is None or ball_pos_w is None:
+        if return_reason_masks:
+            return False, 0.0, {}
+        return False, 0.0
+
+    device = ball_pos_w.device
+    num_envs = ball_pos_w.shape[0]
+
+    if net_contact is None:
+        net_contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    if court_bounds is None:
+        court_bounds = {
+            "x": (-6.7, 6.7),
+            "y": (-3.05, 3.05),
+        }
+
+    ball_x = ball_pos_w[:, 0]
+    ball_y = ball_pos_w[:, 1]
+    ball_z = ball_pos_w[:, 2]
+
+    x_min, x_max = court_bounds["x"]
+    y_min, y_max = court_bounds["y"]
+
+    in_drone_half = ball_x > 0.0
+    in_server_half = ~in_drone_half
+
+    net_contact_flag = net_contact
+
+    ball_grounded = ball_z <= z_threshold
+    drone_half_grounded = in_drone_half & ball_grounded
+    server_half_grounded = in_server_half & ball_grounded
+
+    ball_out_x = (ball_x < x_min) | (ball_x > x_max)
+    ball_out_y = (ball_y < y_min) | (ball_y > y_max)
+    ball_out_of_bounds = ball_out_x | ball_out_y
+    drone_half_out = in_drone_half & ball_out_of_bounds
+    server_half_out = in_server_half & ball_out_of_bounds
+
+    ball_too_high = ball_z > max_ball_height
+
+    terminated = (
+        net_contact_flag
+        | drone_half_grounded
+        | server_half_grounded
+        | drone_half_out
+        | server_half_out
+        | ball_too_high
+    )
+
+    rewards = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    rewards = torch.where(server_half_grounded, torch.tensor(70.0, device=device), rewards)
+    rewards = torch.where(server_half_out & (~server_half_grounded), torch.tensor(10.0, device=device), rewards)
+
+    if not return_reason_masks:
+        return terminated, rewards
+
+    reason_masks = {
+        "net_contact": net_contact_flag,
+        "drone_half_grounded": drone_half_grounded,
+        "server_half_grounded": server_half_grounded,
+        "drone_half_out": drone_half_out,
+        "server_half_out": server_half_out,
+        "ball_too_high": ball_too_high,
+        "reward_server_half_grounded": server_half_grounded,
+        "reward_server_half_out": server_half_out & (~server_half_grounded),
+    }
+    return terminated, rewards, reason_masks
+
+
 def compute_dones(
     ball_pos_w=None,
     racket_pos_w=None,

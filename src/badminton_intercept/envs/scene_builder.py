@@ -110,7 +110,7 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
                 restitution_combine_mode="multiply",
                 static_friction=0.5,
                 dynamic_friction=0.5,
-                restitution=0.1,
+                restitution=0.7,
             ),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,

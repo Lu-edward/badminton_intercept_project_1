@@ -113,6 +113,12 @@ class InterceptEnv(DirectRLEnv):
         self._prev_racket_contact_pos_w = None
         self._prev_racket_normal_w = None
         self._contact_reference_valid = None
+        self.enable_post_hit_tracking = bool(getattr(cfg, "enable_post_hit_tracking", False))
+        self.post_hit = None
+        self._hit_drone_pos_w = None
+        self._hit_drone_quat_w = None
+        self._hit_drone_lin_vel_w = None
+        self._hit_drone_ang_vel_w = None
         self._launch_sampler_mode = get_launch_sampler_mode(cfg)
         self._launch_libraries: dict[int, dict[str, Any]] | None = None
         self._curriculum = CurriculumManager(
@@ -396,6 +402,12 @@ class InterceptEnv(DirectRLEnv):
         self._prev_racket_contact_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._prev_racket_normal_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._contact_reference_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self.post_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._hit_drone_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+        self._hit_drone_quat_w = torch.zeros((self.num_envs, 4), device=self.device)
+        self._hit_drone_quat_w[:, 0] = 1.0
+        self._hit_drone_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+        self._hit_drone_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._resolve_force_body_ids()
         self._resolve_racket_body_ids()
 
@@ -583,7 +595,25 @@ class InterceptEnv(DirectRLEnv):
             racket_normal_w=racket_normal_w,
             sensor_contact=sensor_contact,
         )
-        return candidate_contact & velocity_confirmed, d_axis
+        contact = candidate_contact & velocity_confirmed
+        
+        # 任务二模式：更新 post-hit 标志并保存 hit 时刻的无人机状态
+        # 只有当击球姿态正确（球拍朝向对方场地，normal_x < 0）时才追踪球
+        if self.enable_post_hit_tracking and self.post_hit is not None and contact.any():
+            from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
+            drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
+            normal_x = compute_racket_normal_x_component(drone_quat_w)
+            correct_posture = normal_x < 0.0
+            
+            newly_hit = contact & (~self.post_hit) & correct_posture
+            if newly_hit.any():
+                self.post_hit[newly_hit] = True
+                self._hit_drone_pos_w[newly_hit] = drone_pos_w[newly_hit]
+                self._hit_drone_quat_w[newly_hit] = drone_quat_w[newly_hit]
+                self._hit_drone_lin_vel_w[newly_hit] = drone_lin_vel_w[newly_hit]
+                self._hit_drone_ang_vel_w[newly_hit] = drone_ang_vel_w[newly_hit]
+        
+        return contact, d_axis
 
     def _capture_contact_reference_state(self, env_ids=None):
         """捕获当前帧状态作为下一帧的参考，用于扫掠接触检测"""
@@ -809,6 +839,15 @@ class InterceptEnv(DirectRLEnv):
             drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
             ball_pos_w = self._shuttlecock.data.root_pos_w
             ball_lin_vel_w = self._shuttlecock.data.root_lin_vel_w
+            
+            # 任务二模式：post-hit 阶段使用 hit 时刻的无人机状态
+            if self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
+                post_hit_mask = self.post_hit
+                drone_pos_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_pos_w, drone_pos_w)
+                drone_quat_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_quat_w, drone_quat_w)
+                drone_lin_vel_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_lin_vel_w, drone_lin_vel_w)
+                drone_ang_vel_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_ang_vel_w, drone_ang_vel_w)
+            
             drone_pos_local = drone_pos_w
             ball_pos_local = ball_pos_w
             if hasattr(self.scene, "env_origins"):
@@ -858,6 +897,36 @@ class InterceptEnv(DirectRLEnv):
             yaw = self._quat_to_yaw(drone_quat_w)
             drone_up_w = self._quat_to_up_axis_w(drone_quat_w)
             bound_dist = self._compute_bound_distance(drone_pos_w)
+            
+            # 任务二模式：使用 compute_rewards_task2
+            if self.enable_post_hit_tracking:
+                from badminton_intercept.mdp.rewards import compute_rewards_task2, compute_racket_normal_x_component
+                normal_x = compute_racket_normal_x_component(drone_quat_w)
+                
+                rewards = compute_rewards_task2(
+                    racket_pos_w=racket_pos_w,
+                    ball_pos_w=ball_pos_w,
+                    ball_vel_w=ball_lin_vel_w,
+                    contact=contact,
+                    action=self._actions,
+                    prev_action=self._prev_actions,
+                    yaw=yaw,
+                    d_axis=d_axis,
+                    bound_dist=bound_dist,
+                    drone_up_w=drone_up_w,
+                    drone_ang_vel_w=drone_ang_vel_w,
+                    drone_lin_vel_w=drone_lin_vel_w,
+                    drone_pos_w=drone_pos_w,
+                    drone_quat_w=drone_quat_w,
+                    episode_length_buf=self.episode_length_buf,
+                    max_episode_length=self.max_episode_length,
+                    has_hit_ball=self.post_hit,
+                    c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
+                    c_vert_vel=float(getattr(self.cfg, "reward_c_vert_vel", 0.1)),
+                )
+                return rewards["total"]
+            
+            # 任务一模式：使用原有奖励函数
             rewards = compute_rewards(
                 racket_pos_w=racket_pos_w,
                 ball_pos_w=ball_pos_w,
@@ -905,21 +974,80 @@ class InterceptEnv(DirectRLEnv):
             # 使用无人机的最下面点来判断（中心高度 - 0.13m）
             drone_bottom_z = drone_pos_local[:, 2] - 0.13
             safe_bounds = {"x": (0.0, 6.7), "y": (-3.05, 3.05), "z": (0.2, 3.0)}  # 最下面不低于20cm
-            terminated, truncated, reason_masks = compute_dones(
-                ball_pos_w=ball_pos_local,
-                racket_pos_w=racket_pos_local,
-                drone_pos_w=drone_pos_local,
-                drone_bottom_z=drone_bottom_z,  # 传递最下面高度用于z边界判定
-                contact=contact,
-                net_contact=net_contact,
-                drone_up_w=drone_up_w,
-                episode_length_buf=self.episode_length_buf,
-                max_episode_length=self.max_episode_length,
-                safe_bounds=safe_bounds,
-                z_threshold=0.1,
-                return_reason_masks=True,
-            )
-            self._last_done_reasons = reason_masks
+            
+            # 任务二模式：post-hit 阶段使用新的 termination 逻辑
+            if self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
+                from badminton_intercept.mdp.terminations import compute_dones_task2
+                
+                post_hit_envs = self.post_hit
+                terminated = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                truncated = torch.zeros_like(terminated)
+                reason_masks = {}
+                
+                # post-hit 环境：使用 compute_dones_task2
+                if post_hit_envs.any():
+                    task2_court_bounds = {"x": (-6.7, 6.7), "y": (-3.05, 3.05)}
+                    terminated_task2, rewards_task2, reason_masks_task2 = compute_dones_task2(
+                        ball_pos_w=ball_pos_local[post_hit_envs],
+                        net_contact=net_contact[post_hit_envs],
+                        z_threshold=0.1,
+                        max_ball_height=7.0,
+                        court_bounds=task2_court_bounds,
+                        return_reason_masks=True,
+                    )
+                    terminated[post_hit_envs] = terminated_task2
+                    
+                    # 转换 reason_masks 到完整形状
+                    for key, mask in reason_masks_task2.items():
+                        full_mask = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                        full_mask[post_hit_envs] = mask
+                        reason_masks[key] = full_mask
+                
+                # 非 post-hit 环境：使用原有 compute_dones 逻辑
+                non_post_hit = ~post_hit_envs
+                if non_post_hit.any():
+                    terminated_non, truncated_non, reason_masks_non = compute_dones(
+                        ball_pos_w=ball_pos_local[non_post_hit],
+                        racket_pos_w=racket_pos_local[non_post_hit],
+                        drone_pos_w=drone_pos_local[non_post_hit],
+                        drone_bottom_z=drone_bottom_z[non_post_hit],
+                        contact=contact[non_post_hit],
+                        net_contact=net_contact[non_post_hit],
+                        drone_up_w=drone_up_w[non_post_hit],
+                        episode_length_buf=self.episode_length_buf[non_post_hit],
+                        max_episode_length=self.max_episode_length,
+                        safe_bounds=safe_bounds,
+                        z_threshold=0.1,
+                        return_reason_masks=True,
+                    )
+                    terminated[non_post_hit] = terminated_non
+                    truncated[non_post_hit] = truncated_non
+                    
+                    # 合并 reason_masks
+                    for key, mask in reason_masks_non.items():
+                        if key not in reason_masks:
+                            reason_masks[key] = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                        reason_masks[key][non_post_hit] = mask
+                
+                self._last_done_reasons = reason_masks
+            else:
+                # 任务一模式或任务二 pre-hit 阶段：使用原有逻辑
+                terminated, truncated, reason_masks = compute_dones(
+                    ball_pos_w=ball_pos_local,
+                    racket_pos_w=racket_pos_local,
+                    drone_pos_w=drone_pos_local,
+                    drone_bottom_z=drone_bottom_z,  # 传递最下面高度用于z边界判定
+                    contact=contact,
+                    net_contact=net_contact,
+                    drone_up_w=drone_up_w,
+                    episode_length_buf=self.episode_length_buf,
+                    max_episode_length=self.max_episode_length,
+                    safe_bounds=safe_bounds,
+                    z_threshold=0.1,
+                    return_reason_masks=True,
+                )
+                self._last_done_reasons = reason_masks
+            
             if hasattr(self, "extras"):
                 # 只有当有 env 真正结束时才上报 episode 统计
                 num_resets = int((terminated | truncated).sum().item())
@@ -1362,6 +1490,18 @@ class InterceptEnv(DirectRLEnv):
             # 重置扫掠接触检测的参考状态
             if self._contact_reference_valid is not None:
                 self._contact_reference_valid[env_ids] = False
+            if self.post_hit is not None:
+                self.post_hit[env_ids] = False
+            # 重置 hit 时刻保存的无人机状态
+            if self._hit_drone_pos_w is not None:
+                self._hit_drone_pos_w[env_ids] = 0.0
+            if self._hit_drone_quat_w is not None:
+                self._hit_drone_quat_w[env_ids] = 0.0
+                self._hit_drone_quat_w[env_ids, 0] = 1.0
+            if self._hit_drone_lin_vel_w is not None:
+                self._hit_drone_lin_vel_w[env_ids] = 0.0
+            if self._hit_drone_ang_vel_w is not None:
+                self._hit_drone_ang_vel_w[env_ids] = 0.0
             return
 
         return reset_subenvs(env_ids)
