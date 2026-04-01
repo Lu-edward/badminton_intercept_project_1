@@ -1,2 +1,10 @@
-videos/ 
+videos/
 .ipynb_checkpoints/
+
+scripts/*
+!scripts/train_rsl_official.py
+!scripts/build_shuttle_trajectory_library.py
+!scripts/play_trained_policy.py
+
+scripts/__pycache__/
+scripts/test/
