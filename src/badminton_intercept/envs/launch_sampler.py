@@ -99,22 +99,25 @@ def build_launch_sampling_spec(cfg: Any, stage: CurriculumStage) -> LaunchSampli
     y_margin = float(getattr(cfg, "launch_landing_margin_y_m", 0.1))
 
     use_near_net_init_x = bool(getattr(cfg, "launch_use_near_net_init_x", True))
-    if use_near_net_init_x:
+    stage_ball_init_x_range = tuple(float(v) for v in getattr(stage, "ball_init_x_range", (-6.0, -2.0)))
+    
+    if use_near_net_init_x and stage_ball_init_x_range == (-6.0, -2.0):
         init_x_range = tuple(float(v) for v in getattr(cfg, "launch_ball_init_x_range", (-4.5, -1.8)))
     else:
-        init_x_range = tuple(float(v) for v in getattr(cfg, "ball_init_x_range", (-6.0, -2.0)))
-    init_y_range = tuple(float(v) for v in getattr(cfg, "ball_init_y_range", (-2.5, 2.5)))
+        init_x_range = stage_ball_init_x_range
+    
+    init_y_range = tuple(float(v) for v in getattr(stage, "ball_init_y_range", (-1, 1)))
 
     center_ball_init_z_on_net = bool(getattr(cfg, "launch_center_ball_init_z_on_net", True))
     z_half_span_m = float(getattr(cfg, "launch_ball_init_z_half_span_m", 0.3))
     if center_ball_init_z_on_net:
         init_z_range = (max(0.2, net_height - z_half_span_m), net_height + z_half_span_m)
     else:
-        init_z_range = tuple(float(v) for v in getattr(cfg, "ball_init_z_range", (1.5, 2.5)))
+        init_z_range = tuple(float(v) for v in getattr(stage, "ball_init_z_range", (1.35, 1.75)))
 
     cumulative_v_forward_range, cumulative_v_up_range = _build_cumulative_stage_velocity_ranges(stage)
     v_forward_range = tuple(float(v) for v in cumulative_v_forward_range)
-    v_side_range = tuple(float(v) for v in getattr(cfg, "ball_vel_y_range", (-3.0, 3.0)))
+    v_side_range = tuple(float(v) for v in getattr(stage, "ball_vel_y_range", (-1.5, 1.5)))
     v_up_range = tuple(float(v) for v in cumulative_v_up_range)
 
     boosted_vx_lo = float(getattr(cfg, "launch_vx_min_for_cross", 6.0))

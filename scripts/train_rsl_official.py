@@ -43,6 +43,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--init_curriculum_stage", type=int, default=None, help="Deprecated 0-based alias: 0=stage1, 1=stage2, 2=stage3.")
     parser.add_argument("--freeze_curriculum_stage", action="store_true", default=False, help="Keep training fixed at the selected curriculum stage without auto-promotion.")
     parser.add_argument("--enable_post_hit_tracking", action="store_true", default=False, help="Enable post-hit tracking mode for task 2")
+    parser.add_argument("--enable_serve_hover", action="store_true", default=False, help="Enable two-stage serve-hover training")
+    parser.add_argument("--prehit_checkpoint", type=str, default=None, help="Task2 checkpoint used to initialize the frozen pre-hit actor/critic")
     parser.add_argument("--wandb", action="store_true", default=False, help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="badminton_intercept", help="Wandb project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team/username)")
@@ -194,6 +196,9 @@ def _set_policy_action_std(policy, target_std: float) -> None:
         raise ValueError("--reset_action_std must be > 0.")
 
     with torch.no_grad():
+        if hasattr(policy, "set_action_std"):
+            policy.set_action_std(target_std)
+            return
         # Try direct attributes first (older rsl-rl versions)
         if hasattr(policy, "log_std"):
             policy.log_std.fill_(math.log(target_std))
@@ -218,6 +223,8 @@ def _set_policy_action_std(policy, target_std: float) -> None:
 
 
 def _get_policy_action_std_mean(policy) -> float:
+    if hasattr(policy, "get_action_std_mean"):
+        return float(policy.get_action_std_mean())
     # Try direct attributes first (older rsl-rl versions)
     if hasattr(policy, "log_std"):
         return float(torch.exp(policy.log_std).mean().item())
@@ -233,22 +240,6 @@ def _get_policy_action_std_mean(policy) -> float:
     # Try output_std (rsl-rl 5.0+ alternative)
     if hasattr(policy, "output_std"):
         return float(policy.output_std.mean().item())
-    raise RuntimeError("Policy does not expose a supported action std parameter.")
-
-
-def _get_policy_action_std_mean(policy) -> float:
-    # Try direct attributes first (older rsl-rl versions)
-    if hasattr(policy, "log_std"):
-        return float(torch.exp(policy.log_std).mean().item())
-    if hasattr(policy, "std"):
-        return float(policy.std.mean().item())
-    # Try distribution attribute (rsl-rl 5.0+)
-    if hasattr(policy, "distribution"):
-        dist = policy.distribution
-        if hasattr(dist, "log_std"):
-            return float(torch.exp(dist.log_std).mean().item())
-        if hasattr(dist, "std"):
-            return float(dist.std.mean().item())
     raise RuntimeError("Policy does not expose a supported action std parameter.")
 
 
@@ -318,6 +309,8 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
                 for key in (
                     "success_rate",
                     "success_contact",
+                    "post_hit_rate",
+                    "wrong_hit_rate",
                     "num_resets",
                     "curriculum_stage_id",
                     "failure_server_side_grounded",
@@ -480,6 +473,8 @@ def main() -> None:
     env_cfg.seed = args_cli.seed
     if args_cli.episode_length_s is not None:
         env_cfg.episode_length_s = args_cli.episode_length_s
+    elif args_cli.enable_serve_hover:
+        env_cfg.episode_length_s = 10.0
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
     if requested_stage_id is not None:
@@ -488,7 +483,12 @@ def main() -> None:
 
     if args_cli.enable_post_hit_tracking:
         env_cfg.enable_post_hit_tracking = True
-        env_cfg.curriculum_initial_stage_id = 3
+        env_cfg.curriculum_initial_stage_id = requested_stage_id if requested_stage_id is not None else 1
+        env_cfg.curriculum_fixed_stage = True
+
+    if args_cli.enable_serve_hover:
+        env_cfg.enable_serve_hover = True
+        env_cfg.enable_post_hit_tracking = True
         env_cfg.curriculum_fixed_stage = True
 
     runner_cfg = BadmintonInterceptPPORunnerCfg()
@@ -524,6 +524,12 @@ def main() -> None:
         if args_cli.learning_rate is None:
             runner_cfg.algorithm.learning_rate = 1e-4
 
+    if args_cli.enable_serve_hover:
+        runner_cfg.enable_serve_hover = True
+        runner_cfg.prehit_checkpoint_path = args_cli.prehit_checkpoint or ""
+        if args_cli.learning_rate is None:
+            runner_cfg.algorithm.learning_rate = 1e-4
+
     if checkpoint_mode == "resume":
         runner_cfg.resume = True
     if args_cli.load_run is not None:
@@ -554,6 +560,8 @@ def main() -> None:
                 "checkpoint_mode": checkpoint_mode,
                 "curriculum_stage_id": requested_stage_id,
                 "freeze_curriculum_stage": args_cli.freeze_curriculum_stage,
+                "enable_serve_hover": args_cli.enable_serve_hover,
+                "prehit_checkpoint": args_cli.prehit_checkpoint,
                 "curriculum_promote_success_rate": env_cfg.curriculum_promote_success_rate,
                 "curriculum_promote_iteration_streak": env_cfg.curriculum_promote_iteration_streak,
             },
@@ -578,18 +586,29 @@ def main() -> None:
         else:
             resume_path = _resolve_checkpoint_path(log_root, args_cli.load_run, args_cli.load_checkpoint)
 
+    if args_cli.enable_serve_hover and checkpoint_mode == "fresh" and not args_cli.prehit_checkpoint:
+        raise ValueError("--prehit_checkpoint is required when starting fresh serve-hover training.")
+
     env = RslRlVecEnvWrapper(env, clip_actions=runner_cfg.clip_actions)
     # 处理rsl-rl版本兼容性 - 必须在to_dict()之前调用，因为函数需要操作配置对象的属性
     handle_deprecated_rsl_rl_cfg(runner_cfg, "5.0.1")
     runner_cfg_dict = runner_cfg.to_dict()
-    runner = OnPolicyRunner(env, runner_cfg_dict, log_dir=log_dir, device=runner_cfg.device)
+    runner_cls = OnPolicyRunner
+    if args_cli.enable_serve_hover:
+        from badminton_intercept.train.serve_hover_runner import ServeHoverOnPolicyRunner
+
+        runner_cls = ServeHoverOnPolicyRunner
+    runner = runner_cls(env, runner_cfg_dict, log_dir=log_dir, device=runner_cfg.device)
 
     if checkpoint_mode == "resume" and resume_path is not None:
         print(f"[INFO] Resuming runner from checkpoint: {resume_path}")
         runner.load(resume_path)
     elif checkpoint_mode == "finetune" and resume_path is not None:
         print(f"[INFO] Initializing policy weights from checkpoint: {resume_path}")
-        _load_finetune_checkpoint(runner, resume_path)
+        if args_cli.enable_serve_hover:
+            runner.load(resume_path, load_optimizer=False)
+        else:
+            _load_finetune_checkpoint(runner, resume_path)
 
     if args_cli.reset_action_std is not None:
         _set_policy_action_std(_get_runner_policy(runner), args_cli.reset_action_std)
@@ -634,14 +653,17 @@ def main() -> None:
         if requested_stage_id is not None:
             curriculum.set_stage_by_id(requested_stage_id)
             print(f"[INFO] Set initial curriculum stage to {requested_stage_id} ({curriculum.current_stage.name})")
-        if args_cli.freeze_curriculum_stage:
+        if args_cli.freeze_curriculum_stage or args_cli.enable_post_hit_tracking:
             print(f"[INFO] Curriculum auto-promotion disabled at stage {curriculum.current_stage.stage_id}.")
     else:
         print("[WARN] Curriculum not found in env.")
 
     if args_cli.wandb:
         _patch_runner_log_for_wandb(runner)
-    _patch_runner_log_for_curriculum(runner, curriculum, freeze_stage=args_cli.freeze_curriculum_stage)
+    freeze_curriculum = bool(
+        args_cli.freeze_curriculum_stage or args_cli.enable_post_hit_tracking or args_cli.enable_serve_hover
+    )
+    _patch_runner_log_for_curriculum(runner, curriculum, freeze_stage=freeze_curriculum)
 
     if checkpoint_mode == "finetune" and args_cli.reset_action_std is None:
         current_std = _get_policy_action_std_mean(_get_runner_policy(runner))

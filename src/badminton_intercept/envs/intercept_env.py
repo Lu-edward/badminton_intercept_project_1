@@ -46,9 +46,12 @@ from badminton_intercept.envs.launch_sampler import (
     validate_launch_library_payload,
 )
 from badminton_intercept.mdp.curriculum import CurriculumManager
-from badminton_intercept.mdp.observations import build_actor_critic_observations
-from badminton_intercept.mdp.rewards import compute_rewards
-from badminton_intercept.mdp.terminations import compute_dones
+from badminton_intercept.mdp.observations import (
+    build_actor_critic_observations,
+    build_serve_hover_observations,
+)
+from badminton_intercept.mdp.rewards import compute_rewards, compute_rewards_serve_hover
+from badminton_intercept.mdp.terminations import compute_dones, compute_dones_serve_hover
 from badminton_intercept.physics.air_params import AirYamlParams, load_air_yaml_params
 from badminton_intercept.physics.shuttle_aero import compute_drag_force_tensor
 from badminton_intercept.randomization.reset_manager import reset_subenvs
@@ -66,6 +69,12 @@ class InterceptEnv(DirectRLEnv):
     """Interception task environment with IsaacLab scene wiring and local fallback mode."""
 
     def __init__(self, cfg, render_mode=None, **kwargs):
+        self.enable_serve_hover = bool(getattr(cfg, "enable_serve_hover", False))
+        if self.enable_serve_hover:
+            cfg.enable_post_hit_tracking = True
+            cfg.observation_space = 21
+            cfg.state_space = 21
+
         self._scene_cfgs: SceneEntityConfigs | None = None
         self._drone = None
         self._shuttlecock = None
@@ -115,10 +124,17 @@ class InterceptEnv(DirectRLEnv):
         self._contact_reference_valid = None
         self.enable_post_hit_tracking = bool(getattr(cfg, "enable_post_hit_tracking", False))
         self.post_hit = None
+        self._just_entered_post_hit = None
+        self._serve_hover_target_pos = None
         self._hit_drone_pos_w = None
         self._hit_drone_quat_w = None
         self._hit_drone_lin_vel_w = None
         self._hit_drone_ang_vel_w = None
+        # Analytical trajectory state
+        self._hit_ball_pos_w = None
+        self._hit_ball_vel_w = None
+        self._hit_time_elapsed = None
+        self._post_hit_trajectory_updated = False  # Guard to update once per step
         self._launch_sampler_mode = get_launch_sampler_mode(cfg)
         self._launch_libraries: dict[int, dict[str, Any]] | None = None
         self._curriculum = CurriculumManager(
@@ -130,6 +146,12 @@ class InterceptEnv(DirectRLEnv):
         initial_stage_id = getattr(cfg, "curriculum_initial_stage_id", None)
         if initial_stage_id is not None:
             self._curriculum.set_stage_by_id(int(initial_stage_id))
+
+        if torch is not None:
+            self._serve_hover_target_pos = torch.tensor(
+                getattr(cfg, "serve_hover_target_pos", (2.0, 0.0, 1.5)),
+                dtype=torch.float32,
+            )
 
         if ISAACLAB_RUNTIME_AVAILABLE:
             super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
@@ -403,11 +425,16 @@ class InterceptEnv(DirectRLEnv):
         self._prev_racket_normal_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._contact_reference_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self.post_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._just_entered_post_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._hit_drone_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._hit_drone_quat_w = torch.zeros((self.num_envs, 4), device=self.device)
         self._hit_drone_quat_w[:, 0] = 1.0
         self._hit_drone_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._hit_drone_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+        # Analytical trajectory: ball state at hit moment
+        self._hit_ball_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+        self._hit_ball_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+        self._hit_time_elapsed = torch.zeros((self.num_envs,), device=self.device)
         self._resolve_force_body_ids()
         self._resolve_racket_body_ids()
 
@@ -596,23 +623,34 @@ class InterceptEnv(DirectRLEnv):
             sensor_contact=sensor_contact,
         )
         contact = candidate_contact & velocity_confirmed
-        
-        # 任务二模式：更新 post-hit 标志并保存 hit 时刻的无人机状态
+
+        # 任务二模式：更新 post-hit 标志并保存 hit 时刻的状态
         # 只有当击球姿态正确（球拍朝向对方场地，normal_x < 0）时才追踪球
         if self.enable_post_hit_tracking and self.post_hit is not None and contact.any():
             from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
             drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
             normal_x = compute_racket_normal_x_component(drone_quat_w)
             correct_posture = normal_x < 0.0
-            
+
             newly_hit = contact & (~self.post_hit) & correct_posture
             if newly_hit.any():
                 self.post_hit[newly_hit] = True
+                if self._just_entered_post_hit is not None:
+                    self._just_entered_post_hit[newly_hit] = True
                 self._hit_drone_pos_w[newly_hit] = drone_pos_w[newly_hit]
                 self._hit_drone_quat_w[newly_hit] = drone_quat_w[newly_hit]
                 self._hit_drone_lin_vel_w[newly_hit] = drone_lin_vel_w[newly_hit]
                 self._hit_drone_ang_vel_w[newly_hit] = drone_ang_vel_w[newly_hit]
-        
+
+                # 保存球的位置和速度作为轨迹起点
+                ball_pos_w = self._shuttlecock.data.root_pos_w
+                ball_vel_w = self._shuttlecock.data.root_lin_vel_w
+                self._hit_ball_pos_w[newly_hit] = ball_pos_w[newly_hit]
+                self._hit_ball_vel_w[newly_hit] = ball_vel_w[newly_hit]
+
+                # 重置轨迹计时器
+                self._hit_time_elapsed[newly_hit] = 0.0
+
         return contact, d_axis
 
     def _capture_contact_reference_state(self, env_ids=None):
@@ -710,6 +748,10 @@ class InterceptEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions):
         self.last_actions = actions
+        # Reset trajectory update guard at start of each step
+        self._post_hit_trajectory_updated = False
+        if self._just_entered_post_hit is not None:
+            self._just_entered_post_hit.zero_()
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
             if self._actions is None:
                 self._actions = torch.zeros((self.num_envs, 4), device=self.device)
@@ -831,22 +873,73 @@ class InterceptEnv(DirectRLEnv):
         )
         return None
 
+    def _apply_post_hit_analytical_trajectory(self):
+        """Override ball position using analytical trajectory for post-hit environments.
+
+        After a hit is detected, the ball follows a hybrid analytical trajectory:
+        - Horizontal (X-Y): Logarithmic solution for quadratic drag
+        - Vertical (Z): Exponential solution for linearized drag
+
+        Guard: Only updates once per step to avoid time being incremented multiple times.
+        """
+        if not (ISAACLAB_RUNTIME_AVAILABLE and torch is not None):
+            return
+        if self._shuttlecock is None:
+            return
+        if not self.enable_post_hit_tracking:
+            return
+        trajectory_mode = getattr(self.cfg, "post_hit_trajectory_mode", "physx")
+        if trajectory_mode != "analytical":
+            return
+        if self.post_hit is None or not self.post_hit.any():
+            return
+        if self._post_hit_trajectory_updated:
+            return
+
+        from badminton_intercept.physics.shuttle_aero import (
+            get_trajectory_point_batch,
+            get_trajectory_velocity_batch,
+        )
+
+        post_hit_mask = self.post_hit
+        sim_dt = float(getattr(self.cfg, "sim_dt", 0.005))
+
+        # Increment time elapsed since hit for post-hit environments
+        self._hit_time_elapsed[post_hit_mask] += sim_dt
+
+        hit_pos = self._hit_ball_pos_w[post_hit_mask]
+        hit_vel = self._hit_ball_vel_w[post_hit_mask]
+        t = self._hit_time_elapsed[post_hit_mask]
+
+        # Compute analytical trajectory positions and velocities
+        new_positions = get_trajectory_point_batch(hit_pos, hit_vel, t)
+        new_velocities = get_trajectory_velocity_batch(hit_pos, hit_vel, t)
+
+        # Override ball position and velocity in simulation
+        env_ids = torch.nonzero(post_hit_mask, as_tuple=False).squeeze(-1)
+        if env_ids.numel() > 0:
+            # Write position (translation + rotation as quaternion)
+            current_quats = self._shuttlecock.data.root_quat_w[env_ids]
+            pos_with_quat = torch.cat([new_positions, current_quats], dim=-1)
+            self._shuttlecock.write_root_pose_to_sim(pos_with_quat, env_ids=env_ids)
+            # Write velocity (linear + angular)
+            current_ang_vel = self._shuttlecock.data.root_ang_vel_w[env_ids]
+            vel_with_ang = torch.cat([new_velocities, current_ang_vel], dim=-1)
+            self._shuttlecock.write_root_velocity_to_sim(vel_with_ang, env_ids=env_ids)
+
+        self._post_hit_trajectory_updated = True
+
+
     def _get_observations(self):
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
             self._ensure_runtime_buffers()
+            # Override ball with analytical trajectory for post-hit environments
+            self._apply_post_hit_analytical_trajectory()
             # Enforce a hard post-step speed cap so logged/observed states remain bounded.
             self._enforce_linear_speed_limit()
             drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
             ball_pos_w = self._shuttlecock.data.root_pos_w
             ball_lin_vel_w = self._shuttlecock.data.root_lin_vel_w
-            
-            # 任务二模式：post-hit 阶段使用 hit 时刻的无人机状态
-            if self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
-                post_hit_mask = self.post_hit
-                drone_pos_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_pos_w, drone_pos_w)
-                drone_quat_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_quat_w, drone_quat_w)
-                drone_lin_vel_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_lin_vel_w, drone_lin_vel_w)
-                drone_ang_vel_w = torch.where(post_hit_mask.unsqueeze(-1), self._hit_drone_ang_vel_w, drone_ang_vel_w)
             
             drone_pos_local = drone_pos_w
             ball_pos_local = ball_pos_w
@@ -862,27 +955,55 @@ class InterceptEnv(DirectRLEnv):
                 "drag_length": self._drag_length_m,
                 "ball_mass": self._shuttle_mass_kg,
             }
-            obs = build_actor_critic_observations(
-                drone_pos=drone_pos_local,
-                drone_quat_w=drone_quat_w,
-                drone_lin_vel=drone_lin_vel_w,
-                drone_ang_vel=drone_ang_vel_w,
-                ball_pos=ball_pos_local,
-                ball_lin_vel=ball_lin_vel_w,
-                hit_time_s=self._launch_hit_time_s,
-                hit_point_rel=hit_point_rel_w,
-                privileged=privileged,
-                add_actor_noise=True,
-                noise_std=0.01,
-            )
+            if self.enable_serve_hover:
+                hover_target = self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype)
+                hover_target = hover_target.unsqueeze(0).expand(self.num_envs, -1)
+                post_hit_mask = (
+                    self.post_hit.unsqueeze(-1)
+                    if self.post_hit is not None
+                    else torch.zeros((self.num_envs, 1), device=drone_pos_local.device, dtype=torch.bool)
+                )
+                obs = build_serve_hover_observations(
+                    drone_pos=drone_pos_local,
+                    drone_quat_w=drone_quat_w,
+                    drone_lin_vel=drone_lin_vel_w,
+                    drone_ang_vel=drone_ang_vel_w,
+                    ball_pos=ball_pos_local,
+                    ball_lin_vel=ball_lin_vel_w,
+                    hit_time_s=self._launch_hit_time_s,
+                    hit_point_rel=hit_point_rel_w,
+                    hover_target_pos=hover_target,
+                    post_hit_mask=post_hit_mask,
+                    privileged=privileged,
+                    add_actor_noise=True,
+                    noise_std=0.01,
+                )
+            else:
+                obs = build_actor_critic_observations(
+                    drone_pos=drone_pos_local,
+                    drone_quat_w=drone_quat_w,
+                    drone_lin_vel=drone_lin_vel_w,
+                    drone_ang_vel=drone_ang_vel_w,
+                    ball_pos=ball_pos_local,
+                    ball_lin_vel=ball_lin_vel_w,
+                    hit_time_s=self._launch_hit_time_s,
+                    hit_point_rel=hit_point_rel_w,
+                    privileged=privileged,
+                    add_actor_noise=True,
+                    noise_std=0.01,
+                )
             if isinstance(obs, dict):
                 for k, v in obs.items():
                     obs[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0e3, neginf=-1.0e3).clamp(-1.0e3, 1.0e3)
             return obs
+        if self.enable_serve_hover:
+            return build_serve_hover_observations()
         return build_actor_critic_observations()
 
     def _get_rewards(self):
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
+            # Override ball with analytical trajectory for post-hit environments
+            self._apply_post_hit_analytical_trajectory()
             drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
             racket_pos_w = self._get_racket_center_pos_w(drone_pos_w)
             ball_pos_w = self._shuttlecock.data.root_pos_w
@@ -897,15 +1018,37 @@ class InterceptEnv(DirectRLEnv):
             yaw = self._quat_to_yaw(drone_quat_w)
             drone_up_w = self._quat_to_up_axis_w(drone_quat_w)
             bound_dist = self._compute_bound_distance(drone_pos_w)
-            
+
+            # Convert to local coordinates (relative to each env's origin), consistent with _get_dones
+            drone_pos_local = drone_pos_w
+            racket_pos_local = racket_pos_w
+            ball_pos_local = ball_pos_w
+            if hasattr(self.scene, "env_origins"):
+                drone_pos_local = drone_pos_w - self.scene.env_origins
+                racket_pos_local = racket_pos_w - self.scene.env_origins
+                ball_pos_local = ball_pos_w - self.scene.env_origins
+
+            if self.enable_serve_hover:
+                rewards = compute_rewards_serve_hover(
+                    drone_pos_w=drone_pos_local,
+                    drone_up_w=drone_up_w,
+                    drone_ang_vel_w=drone_ang_vel_w,
+                    has_hit_ball=self.post_hit,
+                    hover_target_pos=getattr(self.cfg, "serve_hover_target_pos", (2.0, 0.0, 1.5)),
+                    c_hover_pose=float(getattr(self.cfg, "serve_hover_reward_pose", 5.0)),
+                    c_hover_up=float(getattr(self.cfg, "serve_hover_reward_up", 1.0)),
+                    c_hover_spin=float(getattr(self.cfg, "serve_hover_reward_spin", 0.05)),
+                )
+                return rewards["total"]
+
             # 任务二模式：使用 compute_rewards_task2
             if self.enable_post_hit_tracking:
                 from badminton_intercept.mdp.rewards import compute_rewards_task2, compute_racket_normal_x_component
                 normal_x = compute_racket_normal_x_component(drone_quat_w)
-                
+
                 rewards = compute_rewards_task2(
-                    racket_pos_w=racket_pos_w,
-                    ball_pos_w=ball_pos_w,
+                    racket_pos_w=racket_pos_local,
+                    ball_pos_w=ball_pos_local,
                     ball_vel_w=ball_lin_vel_w,
                     contact=contact,
                     action=self._actions,
@@ -916,7 +1059,7 @@ class InterceptEnv(DirectRLEnv):
                     drone_up_w=drone_up_w,
                     drone_ang_vel_w=drone_ang_vel_w,
                     drone_lin_vel_w=drone_lin_vel_w,
-                    drone_pos_w=drone_pos_w,
+                    drone_pos_w=drone_pos_local,
                     drone_quat_w=drone_quat_w,
                     episode_length_buf=self.episode_length_buf,
                     max_episode_length=self.max_episode_length,
@@ -925,11 +1068,11 @@ class InterceptEnv(DirectRLEnv):
                     c_vert_vel=float(getattr(self.cfg, "reward_c_vert_vel", 0.1)),
                 )
                 return rewards["total"]
-            
+
             # 任务一模式：使用原有奖励函数
             rewards = compute_rewards(
-                racket_pos_w=racket_pos_w,
-                ball_pos_w=ball_pos_w,
+                racket_pos_w=racket_pos_local,
+                ball_pos_w=ball_pos_local,
                 contact=contact,
                 action=self._actions,
                 prev_action=self._prev_actions,
@@ -939,7 +1082,7 @@ class InterceptEnv(DirectRLEnv):
                 drone_up_w=drone_up_w,
                 drone_ang_vel_w=drone_ang_vel_w,
                 drone_lin_vel_w=drone_lin_vel_w,
-                drone_pos_w=drone_pos_w,
+                drone_pos_w=drone_pos_local,
                 episode_length_buf=self.episode_length_buf,
                 max_episode_length=self.max_episode_length,
                 c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
@@ -950,6 +1093,8 @@ class InterceptEnv(DirectRLEnv):
 
     def _get_dones(self):
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
+            # Override ball with analytical trajectory for post-hit environments
+            self._apply_post_hit_analytical_trajectory()
             drone_pos_w, drone_quat_w, _, _ = self._get_drone_kinematics()
             racket_pos_w = self._get_racket_center_pos_w(drone_pos_w)
             ball_pos_w = self._shuttlecock.data.root_pos_w
@@ -974,20 +1119,40 @@ class InterceptEnv(DirectRLEnv):
             # 使用无人机的最下面点来判断（中心高度 - 0.13m）
             drone_bottom_z = drone_pos_local[:, 2] - 0.13
             safe_bounds = {"x": (0.0, 6.7), "y": (-3.05, 3.05), "z": (0.2, 3.0)}  # 最下面不低于20cm
-            
+
+            if self.enable_serve_hover:
+                from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
+
+                normal_x = compute_racket_normal_x_component(drone_quat_w)
+                correct_posture = normal_x < 0.0
+                just_entered_post_hit = self._just_entered_post_hit if self._just_entered_post_hit is not None else torch.zeros_like(contact)
+                contact_for_hover = contact & (~just_entered_post_hit)
+                terminated, truncated, reason_masks = compute_dones_serve_hover(
+                    drone_pos_w=drone_pos_local,
+                    drone_bottom_z=drone_bottom_z,
+                    contact=contact_for_hover,
+                    has_hit_ball=self.post_hit,
+                    correct_posture=correct_posture,
+                    episode_length_buf=self.episode_length_buf,
+                    max_episode_length=self.max_episode_length,
+                    min_height=float(getattr(self.cfg, "serve_hover_min_height", 0.1)),
+                    max_height=float(getattr(self.cfg, "serve_hover_max_height", 4.0)),
+                    return_reason_masks=True,
+                )
+                self._last_done_reasons = reason_masks
             # 任务二模式：post-hit 阶段使用新的 termination 逻辑
-            if self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
+            elif self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
                 from badminton_intercept.mdp.terminations import compute_dones_task2
-                
+
                 post_hit_envs = self.post_hit
                 terminated = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
                 truncated = torch.zeros_like(terminated)
                 reason_masks = {}
-                
+
                 # post-hit 环境：使用 compute_dones_task2
                 if post_hit_envs.any():
                     task2_court_bounds = {"x": (-6.7, 6.7), "y": (-3.05, 3.05)}
-                    terminated_task2, rewards_task2, reason_masks_task2 = compute_dones_task2(
+                    terminated_task2, rewards_task2, truncated_task2, reason_masks_task2 = compute_dones_task2(
                         ball_pos_w=ball_pos_local[post_hit_envs],
                         net_contact=net_contact[post_hit_envs],
                         z_threshold=0.1,
@@ -996,22 +1161,32 @@ class InterceptEnv(DirectRLEnv):
                         return_reason_masks=True,
                     )
                     terminated[post_hit_envs] = terminated_task2
-                    
+                    truncated[post_hit_envs] = truncated_task2
+
                     # 转换 reason_masks 到完整形状
                     for key, mask in reason_masks_task2.items():
                         full_mask = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
                         full_mask[post_hit_envs] = mask
                         reason_masks[key] = full_mask
-                
-                # 非 post-hit 环境：使用原有 compute_dones 逻辑
+
+                # 非 post-hit 环境：使用原有 compute_dones 逻辑（但遮蔽 contact 终止）
+                # 原因：这些 envs 正在被击球，contact 会立即终止它们，导致 post_hit 来不及设置
                 non_post_hit = ~post_hit_envs
                 if non_post_hit.any():
+                    contact_masked = contact[non_post_hit].clone()
+                    # 遮蔽掉那些刚被击中（且姿态正确）的 envs，让它们转入 post-hit 而非立即终止
+                    from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
+                    normal_x = compute_racket_normal_x_component(drone_quat_w[non_post_hit])
+                    correct_posture = normal_x < 0.0
+                    transitioning_to_post_hit = contact[non_post_hit] & correct_posture
+                    contact_for_dones = contact_masked & ~transitioning_to_post_hit
+
                     terminated_non, truncated_non, reason_masks_non = compute_dones(
                         ball_pos_w=ball_pos_local[non_post_hit],
                         racket_pos_w=racket_pos_local[non_post_hit],
                         drone_pos_w=drone_pos_local[non_post_hit],
                         drone_bottom_z=drone_bottom_z[non_post_hit],
-                        contact=contact[non_post_hit],
+                        contact=contact_for_dones,
                         net_contact=net_contact[non_post_hit],
                         drone_up_w=drone_up_w[non_post_hit],
                         episode_length_buf=self.episode_length_buf[non_post_hit],
@@ -1020,15 +1195,17 @@ class InterceptEnv(DirectRLEnv):
                         z_threshold=0.1,
                         return_reason_masks=True,
                     )
+                    # 遮蔽 transition 时刻的 timeout，避免 episode 时间到了就打断转入 post-hit
+                    truncated_non = truncated_non & ~transitioning_to_post_hit
                     terminated[non_post_hit] = terminated_non
                     truncated[non_post_hit] = truncated_non
-                    
+
                     # 合并 reason_masks
                     for key, mask in reason_masks_non.items():
                         if key not in reason_masks:
                             reason_masks[key] = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
                         reason_masks[key][non_post_hit] = mask
-                
+
                 self._last_done_reasons = reason_masks
             else:
                 # 任务一模式或任务二 pre-hit 阶段：使用原有逻辑
@@ -1052,21 +1229,60 @@ class InterceptEnv(DirectRLEnv):
                 # 只有当有 env 真正结束时才上报 episode 统计
                 num_resets = int((terminated | truncated).sum().item())
                 if num_resets > 0:
-                    counts = {k: int(v.sum().item()) for k, v in reason_masks.items()}
-                    summary = dict(counts)
-                    summary["num_resets"] = num_resets
-                    # Provide normalized rates for training logs; raw counts are batch aggregates.
-                    summary["success_rate"] = counts.get("success_contact", 0) / num_resets
-                    summary["failure_ball_drop_rate"] = counts.get("failure_ball_drop", 0) / num_resets
-                    summary["failure_out_of_bounds_rate"] = counts.get("failure_out_of_bounds", 0) / num_resets
-                    summary["failure_tilt_rate"] = counts.get("failure_tilt", 0) / num_resets
-                    summary["timeout_rate"] = counts.get("timeout", 0) / num_resets
-                    if "failure_net_contact" in counts:
-                        summary["failure_net_contact_rate"] = counts.get("failure_net_contact", 0) / num_resets
-                    if "failure_server_side_grounded" in counts:
-                        summary["failure_server_side_grounded_rate"] = (
-                            counts.get("failure_server_side_grounded", 0) / num_resets
+                    done_mask = terminated | truncated
+                    # Keep only two grouped views in logs:
+                    # 1) post-hit internal termination taxonomy (sum to 1 within post-hit done episodes)
+                    # 2) pre-hit termination taxonomy including success-hit (sum to 1 within pre-hit done episodes)
+                    summary = {}
+
+                    zero_mask = torch.zeros_like(done_mask)
+                    if self.post_hit is not None:
+                        post_hit_done_mask = done_mask & self.post_hit
+                    else:
+                        post_hit_done_mask = zero_mask
+                    pre_hit_done_mask = done_mask & (~post_hit_done_mask)
+                    post_hit_done_count = int(post_hit_done_mask.sum().item())
+                    pre_hit_done_count = int(pre_hit_done_mask.sum().item())
+                    # Build exclusive post-hit categories with precedence + unknown fallback.
+                    if post_hit_done_count > 0:
+                        post_hit_remaining = post_hit_done_mask.clone()
+                        post_hit_category_masks = (
+                            ("post_hit_net_contact_rate", reason_masks.get("net_contact", zero_mask)),
+                            ("post_hit_ball_too_high_rate", reason_masks.get("ball_too_high", zero_mask)),
+                            ("post_hit_drone_half_grounded_rate", reason_masks.get("drone_half_grounded", zero_mask)),
+                            ("post_hit_server_half_grounded_rate", reason_masks.get("server_half_grounded", zero_mask)),
+                            ("post_hit_drone_half_out_rate", reason_masks.get("drone_half_out", zero_mask)),
+                            ("post_hit_server_half_out_rate", reason_masks.get("server_half_out", zero_mask)),
                         )
+                        for metric_name, reason_mask in post_hit_category_masks:
+                            category_mask = post_hit_remaining & reason_mask
+                            category_count = int(category_mask.sum().item())
+                            summary[metric_name] = float(category_count / post_hit_done_count)
+                            post_hit_remaining = post_hit_remaining & (~reason_mask)
+
+                    # Pre-hit success means the episode made it into post-hit.
+                    # Therefore its count should match the total number of post-hit-completed episodes.
+                    summary["pre_hit_success_hit_rate"] = float(post_hit_done_count / num_resets)
+
+                    # Build exclusive pre-hit failure categories with precedence.
+                    # Normalize them by all completed episodes so the pre-hit success/failure
+                    # rates live on the same denominator and sum to ~1 together.
+                    pre_hit_remaining = pre_hit_done_mask.clone()
+                    pre_hit_category_masks = (
+                        ("pre_hit_failure_net_contact_rate", reason_masks.get("failure_net_contact", zero_mask)),
+                        ("pre_hit_failure_server_side_grounded_rate", reason_masks.get("failure_server_side_grounded", zero_mask)),
+                        ("pre_hit_failure_ball_drop_rate", reason_masks.get("failure_ball_drop", zero_mask)),
+                        ("pre_hit_failure_out_of_bounds_rate", reason_masks.get("failure_out_of_bounds", zero_mask)),
+                        ("pre_hit_failure_tilt_rate", reason_masks.get("failure_tilt", zero_mask)),
+                        ("pre_hit_timeout_rate", reason_masks.get("timeout", zero_mask)),
+                    )
+                    for metric_name, reason_mask in pre_hit_category_masks:
+                        category_mask = pre_hit_remaining & reason_mask
+                        category_count = int(category_mask.sum().item())
+                        summary[metric_name] = float(category_count / num_resets)
+                        pre_hit_remaining = pre_hit_remaining & (~reason_mask)
+                    # Backward-compatible key used by some log/curriculum pipelines.
+                    summary["success_rate"] = summary["pre_hit_success_hit_rate"]
                     # 添加课程学习阶段信息
                     current_stage = self._curriculum.current_stage
                     summary["curriculum_stage_id"] = current_stage.stage_id
@@ -1492,6 +1708,8 @@ class InterceptEnv(DirectRLEnv):
                 self._contact_reference_valid[env_ids] = False
             if self.post_hit is not None:
                 self.post_hit[env_ids] = False
+            if self._just_entered_post_hit is not None:
+                self._just_entered_post_hit[env_ids] = False
             # 重置 hit 时刻保存的无人机状态
             if self._hit_drone_pos_w is not None:
                 self._hit_drone_pos_w[env_ids] = 0.0
@@ -1502,6 +1720,12 @@ class InterceptEnv(DirectRLEnv):
                 self._hit_drone_lin_vel_w[env_ids] = 0.0
             if self._hit_drone_ang_vel_w is not None:
                 self._hit_drone_ang_vel_w[env_ids] = 0.0
+            if self._hit_ball_pos_w is not None:
+                self._hit_ball_pos_w[env_ids] = 0.0
+            if self._hit_ball_vel_w is not None:
+                self._hit_ball_vel_w[env_ids] = 0.0
+            if self._hit_time_elapsed is not None:
+                self._hit_time_elapsed[env_ids] = 0.0
             return
 
         return reset_subenvs(env_ids)

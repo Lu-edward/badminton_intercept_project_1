@@ -9,6 +9,8 @@ class BadmintonInterceptPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 10000
     save_interval = 500
     experiment_name = "badminton_intercept_direct"
+    enable_serve_hover = False
+    prehit_checkpoint_path = ""
     obs_groups = {
         "policy": ["policy"],
         "critic": ["critic"],

@@ -132,17 +132,11 @@ if ISAACLAB_CFG_AVAILABLE:
         curriculum_initial_stage_id: int | None = None
         curriculum_fixed_stage: bool = False
         randomization_enabled: bool = True
-        # initialization ranges
-        uav_init_x_range: tuple[float, float] = (2.0, 5.0)
-        uav_init_y_range: tuple[float, float] = (-2.5, 2.5)
-        uav_init_z_range: tuple[float, float] = (1.2, 2.0)
+        # initialization ranges (now primarily controlled by curriculum stages)
+        # UAV init ranges are read from curriculum.current_stage
         uav_init_lin_vel_range: tuple[float, float] = (-0.02, 0.02)
-        ball_init_x_range: tuple[float, float] = (-6.0, -2.0)
-        ball_init_y_range: tuple[float, float] = (-2.5, 2.5)
-        ball_init_z_range: tuple[float, float] = (1.5, 2.5)
-        ball_vel_x_range: tuple[float, float] = (4.0, 10.0)
-        ball_vel_y_range: tuple[float, float] = (-3.0, 3.0)
-        ball_vel_z_range: tuple[float, float] = (1.0, 6.0)
+        # Ball init ranges are read from curriculum.current_stage
+        # (ball_vel_x_range and ball_vel_z_range are also in curriculum)
         launch_prediction_dt: float = 0.01
         launch_prediction_horizon_s: float = 3.0
         launch_max_resample_rounds: int = 2
@@ -168,6 +162,14 @@ if ISAACLAB_CFG_AVAILABLE:
         dr_thrust_coeff_scale_range: tuple[float, float] = (0.95, 1.05)
         arena: ArenaCfg = field(default_factory=ArenaCfg)
         enable_post_hit_tracking: bool = False
+        enable_serve_hover: bool = False
+        post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
+        serve_hover_target_pos: tuple[float, float, float] = (2.0, 0.0, 1.5)
+        serve_hover_min_height: float = 0.1
+        serve_hover_max_height: float = 4.0
+        serve_hover_reward_pose: float = 5.0
+        serve_hover_reward_up: float = 1.0
+        serve_hover_reward_spin: float = 0.05
 
 else:
 
@@ -225,16 +227,11 @@ else:
         curriculum_promote_iteration_streak: int = 10
         curriculum_initial_stage_id: int | None = None
         curriculum_fixed_stage: bool = False
-        uav_init_x_range: tuple[float, float] = (2.0, 5.0)
-        uav_init_y_range: tuple[float, float] = (-2.5, 2.5)
-        uav_init_z_range: tuple[float, float] = (1.2, 2.0)
+        # initialization ranges (now primarily controlled by curriculum stages)
+        # UAV init ranges are read from curriculum.current_stage
         uav_init_lin_vel_range: tuple[float, float] = (-0.02, 0.02)
-        ball_init_x_range: tuple[float, float] = (-6.0, -2.0)
-        ball_init_y_range: tuple[float, float] = (-2.5, 2.5)
-        ball_init_z_range: tuple[float, float] = (1.5, 2.5)
-        ball_vel_x_range: tuple[float, float] = (4.0, 10.0)
-        ball_vel_y_range: tuple[float, float] = (-3.0, 3.0)
-        ball_vel_z_range: tuple[float, float] = (1.0, 6.0)
+        # Ball init ranges are read from curriculum.current_stage
+        # (ball_vel_x_range and ball_vel_z_range are also in curriculum)
         launch_prediction_dt: float = 0.01
         launch_prediction_horizon_s: float = 3.0
         launch_max_resample_rounds: int = 2
@@ -260,6 +257,14 @@ else:
         arena: ArenaCfg = field(default_factory=ArenaCfg)
         randomization_enabled: bool = True
         enable_post_hit_tracking: bool = False
+        enable_serve_hover: bool = False
+        post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
+        serve_hover_target_pos: tuple[float, float, float] = (2.0, 0.0, 1.5)
+        serve_hover_min_height: float = 0.1
+        serve_hover_max_height: float = 4.0
+        serve_hover_reward_pose: float = 5.0
+        serve_hover_reward_up: float = 1.0
+        serve_hover_reward_spin: float = 0.05
 
 
 DEFAULT_ENV_CFG = InterceptEnvCfg()

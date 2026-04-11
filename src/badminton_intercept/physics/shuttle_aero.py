@@ -1,9 +1,204 @@
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, NamedTuple
+import math
 
 try:
     import torch
 except Exception:
     torch = None
+
+
+class Vector3(NamedTuple):
+    """Simple 3D vector for trajectory prediction."""
+    x: float
+    y: float
+    z: float
+
+
+# Physical constants for hybrid analytical approximation
+L_REAL = 4.1  # Standard badminton aerodynamics length (Science Robotics)
+ALPHA = 2.0   # Vertical drag amplification coefficient
+BETA = 0.85   # Horizontal effective length scaling coefficient
+G = 9.81      # Gravitational acceleration
+
+# Precomputed constants
+_L_ADJ = BETA * L_REAL
+_GAMMA_ADJ = ALPHA * G / (G * L_REAL) ** 0.5
+
+
+def get_trajectory_point(pos_0: Vector3, vel_0: Vector3, t: float) -> Vector3:
+    """Compute shuttlecock position at time t using hybrid analytical approximation.
+
+    This is a pure mathematical解析运算 (analytical computation) - no loops,
+    numerical integration (Runge-Kutta), or piecewise trajectory logic.
+
+    Algorithm:
+      - Horizontal (X-Y): Logarithmic analytical solution for quadratic drag
+      - Vertical (Z): Exponential analytical solution for linearized drag
+
+    Args:
+        pos_0: Initial position (x_0, y_0, z_0)
+        vel_0: Initial velocity (v_x0, v_y0, v_z0)
+        t: Time since launch (seconds)
+
+    Returns:
+        Vector3 containing (x(t), y(t), z(t))
+    """
+    v_x0, v_y0, v_z0 = vel_0.x, vel_0.y, vel_0.z
+    x_0, y_0, z_0 = pos_0.x, pos_0.y, pos_0.z
+
+    # Step 1: Compute horizontal initial combined speed
+    v_h0_sq = v_x0 * v_x0 + v_y0 * v_y0
+    v_h0 = max(v_h0_sq ** 0.5, 1e-6)  # Avoid division by zero
+
+    # Step 2: Compute horizontal travel distance using logarithmic formula
+    # d_h(t) = L_adj * ln(1 + v_h0/L_adj * t)
+    ratio = v_h0 / _L_ADJ
+    d_h = _L_ADJ * math.log(1.0 + ratio * t)
+
+    # Step 3: Project back to X and Y axes
+    dir_x = v_x0 / v_h0
+    dir_y = v_y0 / v_h0
+    x_t = x_0 + d_h * dir_x
+    y_t = y_0 + d_h * dir_y
+
+    # Step 4: Compute Z height using exponential formula
+    # z(t) = z_0 + (v_z0/γ_adj + g/γ_adj^2) * (1 - e^(-γ_adj*t)) - g/γ_adj * t
+    exp_term = (1.0 - math.exp(-_GAMMA_ADJ * t))
+    z_t = z_0 + (v_z0 / _GAMMA_ADJ + G / (_GAMMA_ADJ * _GAMMA_ADJ)) * exp_term - (G / _GAMMA_ADJ) * t
+
+    return Vector3(x=x_t, y=y_t, z=z_t)
+
+
+def get_trajectory_point_batch(
+    pos_start: "torch.Tensor",
+    vel_start: "torch.Tensor",
+    t: "torch.Tensor",
+) -> "torch.Tensor":
+    """Batch version of trajectory prediction using hybrid analytical approximation.
+
+    Args:
+        pos_start: Initial positions (num_envs, 3) or (N, 3)
+        vel_start: Initial velocities (num_envs, 3) or (N, 3)
+        t: Time(s) at which to compute positions. Can be scalar or (num_envs,) / (N,)
+
+    Returns:
+        positions: Predicted positions with same shape as pos_start
+    """
+    if torch is None:
+        raise RuntimeError("Torch is required for batch trajectory prediction.")
+
+    # Ensure float32/float64 for computation
+    pos = pos_start.float()
+    vel = vel_start.float()
+    device = pos.device
+
+    # Constants as tensors
+    L_adj = torch.tensor(_L_ADJ, device=device, dtype=pos.dtype)
+    gamma_adj = torch.tensor(_GAMMA_ADJ, device=device, dtype=pos.dtype)
+    g = torch.tensor(G, device=device, dtype=pos.dtype)
+
+    v_x0, v_y0, v_z0 = vel[:, 0], vel[:, 1], vel[:, 2]
+    x_0, y_0, z_0 = pos[:, 0], pos[:, 1], pos[:, 2]
+
+    # Horizontal combined speed
+    v_h0 = torch.sqrt(v_x0 * v_x0 + v_y0 * v_y0).clamp_min(1e-6)
+
+    # Ensure t is (N,) shape for broadcasting
+    t = torch.atleast_1d(t).to(pos.dtype)
+    if t.numel() == 1:
+        t = t.expand(pos.shape[0])
+
+    # Horizontal travel distance: d_h(t) = L_adj * ln(1 + v_h0/L_adj * t)
+    d_h = L_adj * torch.log1p((v_h0 / L_adj) * t)
+
+    # X, Y projection
+    x_t = x_0 + d_h * (v_x0 / v_h0)
+    y_t = y_0 + d_h * (v_y0 / v_h0)
+
+    # Z height: z(t) = z_0 + (v_z0/γ_adj + g/γ_adj^2) * (1 - e^(-γ_adj*t)) - g/γ_adj * t
+    exp_term = 1.0 - torch.exp(-gamma_adj * t)
+    z_t = z_0 + (v_z0 / gamma_adj + g / (gamma_adj * gamma_adj)) * exp_term - (g / gamma_adj) * t
+
+    return torch.stack([x_t, y_t, z_t], dim=-1)
+
+
+def get_trajectory_velocity_batch(
+    pos_start: "torch.Tensor",
+    vel_start: "torch.Tensor",
+    t: "torch.Tensor",
+) -> "torch.Tensor":
+    """Compute shuttlecock velocity at time t using derivative of analytical trajectory.
+
+    Args:
+        pos_start: Initial positions (num_envs, 3) or (N, 3) - not used but kept for API consistency
+        vel_start: Initial velocities (num_envs, 3) or (N, 3)
+        t: Time(s) at which to compute velocities. Can be scalar or (N,)
+
+    Returns:
+        velocities: Predicted velocities with same shape as vel_start
+    """
+    if torch is None:
+        raise RuntimeError("Torch is required for batch velocity computation.")
+
+    pos = pos_start.float()
+    vel = vel_start.float()
+    device = pos.device
+
+    # Constants as tensors
+    L_adj = torch.tensor(_L_ADJ, device=device, dtype=pos.dtype)
+    gamma_adj = torch.tensor(_GAMMA_ADJ, device=device, dtype=pos.dtype)
+    g = torch.tensor(G, device=device, dtype=pos.dtype)
+
+    v_x0, v_y0, v_z0 = vel[:, 0], vel[:, 1], vel[:, 2]
+
+    # Horizontal combined speed
+    v_h0 = torch.sqrt(v_x0 * v_x0 + v_y0 * v_y0).clamp_min(1e-6)
+
+    # Ensure t is (N,) shape for broadcasting
+    t = torch.atleast_1d(t).to(pos.dtype)
+    if t.numel() == 1:
+        t = t.expand(pos.shape[0])
+
+    # Velocity in horizontal direction: derivative of d_h(t) = L_adj * ln(1 + v_h0/L_adj * t)
+    # d(d_h)/dt = v_h0 / (1 + v_h0/L_adj * t) = v_h0 * L_adj / (L_adj + v_h0 * t)
+    v_h = v_h0 * L_adj / (L_adj + v_h0 * t)
+
+    # X, Y velocity components
+    vx_t = v_h * (v_x0 / v_h0)
+    vy_t = v_h * (v_y0 / v_h0)
+
+    # Z velocity: derivative of z(t) = z_0 + (v_z0/γ + g/γ^2) * (1 - e^(-γt)) - g/γ * t
+    # vz_t = v_z0 * e^(-γt) - g/γ * (1 - e^(-γt)) = v_z0 * e^(-γt) - g/γ + g/γ * e^(-γt)
+    #       = (v_z0 + g/γ) * e^(-γt) - g/γ
+    exp_term = torch.exp(-gamma_adj * t)
+    vz_t = (v_z0 + g / gamma_adj) * exp_term - (g / gamma_adj)
+
+    return torch.stack([vx_t, vy_t, vz_t], dim=-1)
+
+
+def predict_trajectory_analytical(
+    pos_start: "torch.Tensor",
+    vel_start: "torch.Tensor",
+    max_time: float = 5.0,
+    num_steps: int = 500,
+) -> "torch.Tensor":
+    """Generate full trajectory using analytical approximation.
+
+    Args:
+        pos_start: Initial positions (num_envs, 3)
+        vel_start: Initial velocities (num_envs, 3)
+        max_time: Maximum trajectory duration (seconds)
+        num_steps: Number of time steps to generate
+
+    Returns:
+        positions: Trajectory positions (num_steps, num_envs, 3)
+    """
+    if torch is None:
+        raise RuntimeError("Torch is required for trajectory prediction.")
+
+    t = torch.linspace(0, max_time, num_steps, device=pos_start.device, dtype=pos_start.dtype)
+    positions = get_trajectory_point_batch(pos_start.unsqueeze(0), vel_start.unsqueeze(0), t)
+    return positions.permute(1, 0, 2)  # (num_steps, num_envs, 3)
 
 
 def compute_drag_force(velocity_xyz: Sequence[float], drag_scale: float = 1.0) -> list[float]:

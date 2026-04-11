@@ -11,9 +11,13 @@ class CurriculumStage:
     name: str
     ball_vel_x_range: tuple[float, float]
     ball_vel_z_range: tuple[float, float]
-    uav_init_x_range: tuple[float, float] = (2.0, 5.0)
-    uav_init_y_range: tuple[float, float] = (-2.5, 2.5)
-    uav_init_z_range: tuple[float, float] = (1.2, 2.0)
+    uav_init_x_range: tuple[float, float] = (1.0, 3.0)
+    uav_init_y_range: tuple[float, float] = (-1, 1)
+    uav_init_z_range: tuple[float, float] = (1.0, 1.5)
+    ball_init_x_range: tuple[float, float] = (-3.0, -2.0)
+    ball_init_y_range: tuple[float, float] = (-1, 1)
+    ball_init_z_range: tuple[float, float] = (1.35, 1.75)
+    ball_vel_y_range: tuple[float, float] = (-1.5, 1.5)
 
 
 class CurriculumManager:
@@ -31,28 +35,43 @@ class CurriculumManager:
                 stage_id=1,
                 name="stage_i_follow",
                 ball_vel_x_range=(2.0, 4.0),
+                ball_vel_y_range=(-1.0, 1.0),
                 ball_vel_z_range=(2.0, 6.0),
-                uav_init_x_range=(1.0, 2.0),  # 靠近网
-                uav_init_y_range=(-1.0, 1.0),  # 缩小左右范围
-                uav_init_z_range=(1.0, 1.5),   # 降低高度范围
+                uav_init_x_range=(1.0, 3.0),
+                uav_init_y_range=(-1.0, 1.0),
+                uav_init_z_range=(1.0, 1.5),
+                ball_init_x_range=(-3.0, -2.0),
+                ball_init_y_range=(-1, 1),
+                ball_init_z_range=(1.35, 1.75),
+    
             ),
             CurriculumStage(
                 stage_id=2,
                 name="stage_ii_full_court",
                 ball_vel_x_range=(4.0, 10.0),
+                ball_vel_y_range=(-1.0, 1.0),
                 ball_vel_z_range=(1.0, 6.0),
-                uav_init_x_range=(1.0, 4.0),  # 中等距离
+                uav_init_x_range=(1.0, 3.0),
                 uav_init_y_range=(-1.0, 1.0),
                 uav_init_z_range=(1.0, 1.5),
+                ball_init_x_range=(-3.0, -2.0),
+                ball_init_y_range=(-1, 1),
+                ball_init_z_range=(1.35, 1.75),
+                
             ),
             CurriculumStage(
                 stage_id=3,
                 name="stage_iii_fast_flat",
                 ball_vel_x_range=(8.0, 14.0),
+                ball_vel_y_range=(-1.0, 1.0),
                 ball_vel_z_range=(0.2, 2.0),
-                uav_init_x_range=(1.0, 5.0),  # 全范围
+                uav_init_x_range=(1.0, 3.0),
                 uav_init_y_range=(-1.0, 1.0),
                 uav_init_z_range=(1.0, 1.5),
+                ball_init_x_range=(-3.0, -2.0),
+                ball_init_y_range=(-1, 1),
+                ball_init_z_range=(1.35, 1.75),
+                
             ),
         ]
         self.stage_idx = 0

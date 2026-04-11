@@ -201,33 +201,43 @@ def compute_rewards_task2(
     episode_length_buf=None,
     max_episode_length=None,
     has_hit_ball=None,
-    c_hit: float = 70.0,
-    c_center: float = 10.0,
+    c_hit: float = 50.0,
+    c_center: float = 5.0,
     lambda_c: float = 5.0,
     c_pos: float = 5.0,
-    c_smooth: float = 2.0,
+    c_smooth: float = 0.5,
     c_spin: float = 10.0,
     c_bound: float = 5.0,
     c_ang_vel: float = 0.05,
     c_vert_vel: float = 0.1,
     pos_floor: float = 0.1,
     c_low_shuttle: float = 2.0,
-    c_post_hit_tracking: float = 3.0,
+    c_rpos_anchor: float = 50.0,
+    anchor_pos=(-2, 0, 1.55),
+    w_vel: float = 5.0,
+    v_threshold: float = 1.0,
 ) -> dict:
-    """Compute sparse+dense reward terms for Task 2 (return shot).
-    
-    Task 2 特点：
-    1. 姿态感知 hit 奖励：只有当球拍法向量 x 分量 < 0 时才给予击球奖励
-    2. 甜区击球奖励：根据击球点偏离球拍中心的距离给予奖励
-    3. post-hit 阶段的球追踪奖励
+    """Compute rewards for Task 2 (return shot), organized by phase.
+
+    Phase 1 - 击球阶段 (pre-hit):
+      r_hit:       姿态感知击中奖励（球拍法向量 x < 0 才给）
+      r_center:   甜区奖励
+      r_pos:       位置追踪奖励（球拍靠近球）
+
+    Phase 2 - 击球后 (post-hit):
+      r_pos_anchor: 球靠近目标落点的奖励 25.0 / (1 + 2 * ||ball - anchor||²)
+
+    Phase 3 - 通用（与终止条件相关）:
+      r_smooth, r_spin, r_bound, r_tilt, r_ang, r_vz, r_low_shuttle
     """
     if torch is None or racket_pos_w is None:
         return {
             "total": 0.0,
-            "dense_tracking": 0.0,
             "sparse_hit": 0.0,
+            "hit_velocity": 0.0,
             "sweet_spot_bonus": 0.0,
-            "alignment_reward": 0.0,
+            "dense_tracking": 0.0,
+            "post_hit_pos_anchor": 0.0,
             "smoothness": 0.0,
             "spin_penalty": 0.0,
             "boundary_penalty": 0.0,
@@ -235,87 +245,95 @@ def compute_rewards_task2(
             "ang_vel_penalty": 0.0,
             "vert_vel_penalty": 0.0,
             "low_shuttle_penalty": 0.0,
-            "post_hit_tracking": 0.0,
-            "posture_aware_hit": 0.0,
         }
 
     contact_f = contact.float()
     batch_size = racket_pos_w.shape[0]
-    
-    if has_hit_ball is None:
-        has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=racket_pos_w.device)
+    device = racket_pos_w.device
 
+    if has_hit_ball is None:
+        has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    # ── Phase 1: 击球阶段 ──────────────────────────────────────────────
     normal_x = compute_racket_normal_x_component(drone_quat_w)
     correct_posture = (normal_x < 0.0).float()
     r_hit = c_hit * contact_f * correct_posture
-    r_posture_aware_hit = r_hit.clone()
+
+    # Disable hit-velocity bonus for task2 (ablation requested).
+    r_hit_velocity = torch.zeros(batch_size, device=device)
 
     if d_axis is not None:
         r_center = c_center * torch.exp(-lambda_c * d_axis) * contact_f
     else:
-        r_center = torch.zeros(batch_size, device=racket_pos_w.device)
+        r_center = torch.zeros(batch_size, device=device)
 
+    # ── Phase 2: 击球后 ────────────────────────────────────────────────
+    anchor = torch.tensor(anchor_pos, dtype=racket_pos_w.dtype, device=device)
+    dist_sq = torch.sum((ball_pos_w - anchor) ** 2, dim=-1)
+    r_pos_anchor = c_rpos_anchor / (1.0 + 2 * dist_sq)
+    # 仅在 has_hit_ball 后生效
+    r_pos_anchor = r_pos_anchor * has_hit_ball.float()
+
+    # ── Phase 3: 通用（仅 pre-hit 阶段生效，post-hit 阶段全部归零） ──
+    pre_hit_mask = ~has_hit_ball
+
+    r_x_boundary = -100.0 * (drone_pos_w[:, 0] < 0.1).float() * pre_hit_mask if drone_pos_w is not None else torch.zeros(batch_size, device=device)
+
+    if action is None or prev_action is None:
+        r_smooth = torch.zeros(batch_size, device=device)
+    else:
+        delta_a_sq = torch.sum((action - prev_action) ** 2, dim=-1)
+        r_smooth = c_smooth * torch.exp(-delta_a_sq) * pre_hit_mask
+
+    if yaw is None:
+        r_spin = torch.zeros(batch_size, device=device)
+    else:
+        r_spin = -c_spin * torch.abs(yaw) * pre_hit_mask
+
+    if bound_dist is None:
+        r_bound = torch.zeros(batch_size, device=device)
+    else:
+        r_bound = -c_bound * bound_dist * pre_hit_mask
+
+    if drone_up_w is None:
+        r_tilt = torch.zeros(batch_size, device=device)
+    else:
+        r_tilt = (drone_up_w[:, 2] > 0.0).float() * pre_hit_mask
+
+    if drone_ang_vel_w is None:
+        r_ang = torch.zeros(batch_size, device=device)
+    else:
+        r_ang = -c_ang_vel * torch.linalg.norm(drone_ang_vel_w, dim=-1) * pre_hit_mask
+
+    # 位置追踪奖励（仅 pre-hit 阶段生效）
     d_3d = torch.linalg.norm(ball_pos_w - racket_pos_w, dim=-1)
     d_xy = torch.linalg.norm(ball_pos_w[:, :2] - racket_pos_w[:, :2], dim=-1)
-    
     dist_for_reward = torch.where(d_xy > 0.5, d_xy, d_3d)
-    
-    r_margin = 0.05   
+    r_margin = 0.05
     r_pos = torch.where(
         dist_for_reward <= r_margin,
         torch.full_like(dist_for_reward, c_pos),
         c_pos / (1.0 + dist_for_reward - r_margin)
     )
+    r_pos = r_pos * pre_hit_mask
 
-    r_alignment = torch.zeros_like(r_pos)
+    r_vz = torch.zeros(batch_size, device=device)
+    r_low_shuttle = torch.zeros(batch_size, device=device)
 
-    if action is None or prev_action is None:
-        r_smooth = torch.zeros_like(r_pos)
-    else:
-        delta_a_sq = torch.sum((action - prev_action) ** 2, dim=-1)
-        r_smooth = c_smooth * torch.exp(-delta_a_sq)
-
-    if yaw is None:
-        r_spin = torch.zeros_like(r_pos)
-    else:
-        r_spin = -c_spin * torch.abs(yaw)
-
-    if bound_dist is None:
-        r_bound = torch.zeros_like(r_pos)
-    else:
-        r_bound = -c_bound * bound_dist
-
-    if drone_up_w is None:
-        r_tilt = torch.zeros_like(r_pos)
-    else:
-        r_tilt = (drone_up_w[:, 2] > 0.0).float()
-
-    if drone_ang_vel_w is None:
-        r_ang = torch.zeros_like(r_pos)
-    else:
-        r_ang = -c_ang_vel * torch.linalg.norm(drone_ang_vel_w, dim=-1)
-
-    r_vz = torch.zeros_like(r_pos)
-
-    r_low_shuttle = torch.zeros_like(r_pos)
-
-    r_post_hit = torch.zeros_like(r_pos)
-    if ball_vel_w is not None:
-        ball_speed = torch.linalg.norm(ball_vel_w, dim=-1)
-        ball_moving_towards_opponent = ball_vel_w[:, 0] > 0.0
-        post_hit_mask = has_hit_ball.float()
-        r_post_hit = c_post_hit_tracking * post_hit_mask * ball_moving_towards_opponent.float() * torch.tanh(ball_speed)
-
-    total = (r_hit + r_center + r_pos + r_alignment + r_smooth + 
-             r_spin + r_bound + r_tilt + r_ang + r_vz + r_low_shuttle + r_post_hit)
+    total = (
+        r_hit + r_center
+        + r_pos_anchor
+        + r_smooth + r_spin + r_bound + r_tilt + r_ang + r_vz + r_low_shuttle + r_pos + r_x_boundary
+    )
     total = torch.nan_to_num(total, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
 
     return {
         "total": total,
-        "dense_tracking": r_pos,
         "sparse_hit": r_hit,
+        "hit_velocity": r_hit_velocity,
         "sweet_spot_bonus": r_center,
-        "alignment_reward": r_alignment,
+        "dense_tracking": r_pos,
+        "post_hit_pos_anchor": r_pos_anchor,
         "smoothness": r_smooth,
         "spin_penalty": r_spin,
         "boundary_penalty": r_bound,
@@ -323,6 +341,61 @@ def compute_rewards_task2(
         "ang_vel_penalty": r_ang,
         "vert_vel_penalty": r_vz,
         "low_shuttle_penalty": r_low_shuttle,
-        "post_hit_tracking": r_post_hit,
-        "posture_aware_hit": r_posture_aware_hit,
+        "x_boundary_penalty": r_x_boundary,
+    }
+
+
+def compute_rewards_serve_hover(
+    drone_pos_w=None,
+    drone_up_w=None,
+    drone_ang_vel_w=None,
+    has_hit_ball=None,
+    hover_target_pos=(2.0, 0.0, 1.5),
+    c_hover_pose: float = 5.0,
+    c_hover_up: float = 1.0,
+    c_hover_spin: float = 0.05,
+) -> dict:
+    """Compute post-hit hovering rewards.
+
+    The hover policy is only trained after a valid hit. Before that point the
+    reward is exactly zero so pre-hit task2 behavior stays frozen.
+    """
+    if torch is None or drone_pos_w is None:
+        return {
+            "total": 0.0,
+            "reward_pose": 0.0,
+            "reward_up": 0.0,
+            "reward_spin": 0.0,
+        }
+
+    batch_size = drone_pos_w.shape[0]
+    device = drone_pos_w.device
+    dtype = drone_pos_w.dtype
+    if has_hit_ball is None:
+        has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    active = has_hit_ball.float()
+    target = torch.tensor(hover_target_pos, dtype=dtype, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    dist = torch.linalg.norm(drone_pos_w - target, dim=-1)
+    reward_pose = c_hover_pose / (1.0 + dist)
+    reward_pose = reward_pose * active
+
+    if drone_up_w is None:
+        reward_up = torch.zeros(batch_size, device=device, dtype=dtype)
+    else:
+        reward_up = c_hover_up * torch.clamp(drone_up_w[:, 2], min=0.0, max=1.0) * active
+
+    if drone_ang_vel_w is None:
+        reward_spin = torch.zeros(batch_size, device=device, dtype=dtype)
+    else:
+        reward_spin = -c_hover_spin * torch.linalg.norm(drone_ang_vel_w, dim=-1) * active
+
+    total = reward_pose + reward_up + reward_spin
+    total = torch.nan_to_num(total, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
+    return {
+        "total": total,
+        "reward_pose": reward_pose,
+        "reward_up": reward_up,
+        "reward_spin": reward_spin,
     }

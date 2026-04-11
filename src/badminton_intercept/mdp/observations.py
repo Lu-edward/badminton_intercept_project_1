@@ -102,3 +102,86 @@ def build_actor_critic_observations(
         critic = actor if len(priv_terms) == 0 else torch.cat([actor] + priv_terms, dim=-1)
 
     return {"policy": actor, "critic": critic}
+
+
+def build_serve_hover_observations(
+    drone_pos=None,
+    drone_quat_w=None,
+    drone_lin_vel=None,
+    drone_ang_vel=None,
+    ball_pos=None,
+    ball_lin_vel=None,
+    hit_time_s=None,
+    hit_point_rel=None,
+    hover_target_pos=None,
+    post_hit_mask=None,
+    privileged: dict | None = None,
+    add_actor_noise: bool = False,
+    noise_std: float = 0.01,
+) -> dict:
+    """Build observations for dual-policy serve-hover training.
+
+    Returned groups:
+    - task2_policy: frozen task2 actor input
+    - task2_critic_obs: frozen task2 critic input
+    - policy: hover actor input = drone_state + rpos_hover
+    - critic: hover critic input
+    - post_hit_mask: phase selector used by the dual policy / PPO mask
+    """
+    if torch is None or drone_pos is None:
+        zeros_task2_policy = [0.0] * 31
+        zeros_task2_critic = [0.0] * 34
+        zeros_hover = [0.0] * 21
+        return {
+            "task2_policy": zeros_task2_policy,
+            "task2_critic_obs": zeros_task2_critic,
+            "policy": zeros_hover,
+            "critic": zeros_hover,
+            "post_hit_mask": [[0.0]],
+        }
+
+    task2_obs = build_actor_critic_observations(
+        drone_pos=drone_pos,
+        drone_quat_w=drone_quat_w,
+        drone_lin_vel=drone_lin_vel,
+        drone_ang_vel=drone_ang_vel,
+        ball_pos=ball_pos,
+        ball_lin_vel=ball_lin_vel,
+        hit_time_s=hit_time_s,
+        hit_point_rel=hit_point_rel,
+        privileged=privileged,
+        add_actor_noise=add_actor_noise,
+        noise_std=noise_std,
+    )
+
+    rotmat = _quat_to_rotmat_wxyz(drone_quat_w).reshape(drone_pos.shape[0], 9)
+    if hover_target_pos is None:
+        hover_target_pos = torch.zeros_like(drone_pos)
+    if post_hit_mask is None:
+        post_hit_mask = torch.zeros((drone_pos.shape[0], 1), dtype=drone_pos.dtype, device=drone_pos.device)
+    elif post_hit_mask.dim() == 1:
+        post_hit_mask = post_hit_mask.unsqueeze(-1)
+
+    hover_rpos = hover_target_pos - drone_pos
+    hover_actor = torch.cat(
+        [
+            drone_pos,
+            rotmat,
+            drone_lin_vel,
+            drone_ang_vel,
+            hover_rpos,
+        ],
+        dim=-1,
+    )
+
+    if add_actor_noise and noise_std > 0.0:
+        hover_actor = hover_actor + noise_std * torch.randn_like(hover_actor)
+
+    hover_critic = hover_actor.clone()
+    return {
+        "task2_policy": task2_obs["policy"],
+        "task2_critic_obs": task2_obs["critic"],
+        "policy": hover_actor,
+        "critic": hover_critic,
+        "post_hit_mask": post_hit_mask.to(dtype=hover_actor.dtype),
+    }

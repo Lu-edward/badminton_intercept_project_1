@@ -12,45 +12,54 @@ def compute_dones_task2(
     z_threshold: float = 0.1,
     max_ball_height: float = 7.0,
     court_bounds: dict | None = None,
+    episode_length_buf=None,
+    max_episode_length: int | None = None,
     return_reason_masks: bool = False,
 ):
-    """Compute termination signals and rewards for Task 2.
+    """Compute termination signals and rewards for Task 2 (post-hit phase).
 
-    Task 2 termination conditions:
+    This function handles ONLY the post-hit phase. It assumes all environments
+    have already transitioned past the hit moment.
+
+    Termination conditions (ball-only, no drone/timeout):
     1. Ball touches the net
     2. Ball touches the ground (drone half x>0 or server half x<0)
     3. Ball goes out of bounds (both halves)
     4. Ball height exceeds 7m
 
+    NOTE: There is NO episode timeout for post-hit. The episode runs until the
+    ball actually lands/goes out, regardless of simulated time elapsed.
+
     Reward rules:
-    - Net contact: 0
-    - Drone half ground: 0
-    - Drone half out of bounds: 0
-    - Server half out of bounds: +10
     - Server half ground: +70
-    - Ball height > 7m: 0
+    - Server half out of bounds (no ground): +10
+    - All other conditions: 0
 
     Args:
-        ball_pos_w: Ball position in world frame, shape (N, 3)
+        ball_pos_w: Ball position in local court frame, shape (N, 3)
         net_contact: Boolean tensor for net contact, shape (N,)
         z_threshold: Ground threshold for ball grounded detection
         max_ball_height: Maximum allowed ball height (default 7.0m)
         court_bounds: Dict with 'x' and 'y' bounds, e.g., {'x': (-6.7, 6.7), 'y': (-3.05, 3.05)}
+        episode_length_buf: Unused, kept for API compatibility
+        max_episode_length: Unused, kept for API compatibility
         return_reason_masks: If True, return reason masks dict
 
     Returns:
         If return_reason_masks is False:
             terminated: Boolean tensor of termination flags
             rewards: Float tensor of rewards for each environment
+            truncated: Boolean tensor (always False, no timeout in post-hit)
         If return_reason_masks is True:
             terminated: Boolean tensor of termination flags
             rewards: Float tensor of rewards for each environment
+            truncated: Boolean tensor (always False, no timeout in post-hit)
             reason_masks: Dict of reason masks and reward masks
     """
     if torch is None or ball_pos_w is None:
         if return_reason_masks:
-            return False, 0.0, {}
-        return False, 0.0
+            return False, 0.0, False, {}
+        return False, 0.0, False
 
     device = ball_pos_w.device
     num_envs = ball_pos_w.shape[0]
@@ -101,8 +110,11 @@ def compute_dones_task2(
     rewards = torch.where(server_half_grounded, torch.tensor(70.0, device=device), rewards)
     rewards = torch.where(server_half_out & (~server_half_grounded), torch.tensor(10.0, device=device), rewards)
 
+    # No episode timeout in post-hit: ball runs to completion
+    truncated = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
     if not return_reason_masks:
-        return terminated, rewards
+        return terminated, rewards, truncated
 
     reason_masks = {
         "net_contact": net_contact_flag,
@@ -114,7 +126,77 @@ def compute_dones_task2(
         "reward_server_half_grounded": server_half_grounded,
         "reward_server_half_out": server_half_out & (~server_half_grounded),
     }
-    return terminated, rewards, reason_masks
+    return terminated, rewards, truncated, reason_masks
+
+
+def compute_dones_serve_hover(
+    drone_pos_w=None,
+    drone_bottom_z=None,
+    contact=None,
+    has_hit_ball=None,
+    correct_posture=None,
+    episode_length_buf=None,
+    max_episode_length: int | None = None,
+    min_height: float = 0.1,
+    max_height: float = 4.0,
+    return_reason_masks: bool = False,
+):
+    """Termination logic for serve-hover training.
+
+    Only three conditions remain active:
+    - drone height out of range
+    - wrong_hit
+    - timeout
+    """
+    if torch is None or drone_pos_w is None:
+        if return_reason_masks:
+            return False, False, {}
+        return False, False
+
+    device = drone_pos_w.device
+    num_envs = drone_pos_w.shape[0]
+
+    if contact is None:
+        contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    if has_hit_ball is None:
+        has_hit_ball = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    if correct_posture is None:
+        correct_posture = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    low_height = (
+        drone_bottom_z < min_height
+        if drone_bottom_z is not None
+        else (drone_pos_w[:, 2] < min_height)
+    )
+    high_height = drone_pos_w[:, 2] > max_height
+    height_out_of_range = low_height | high_height
+
+    pre_hit_invalid_contact = contact & (~has_hit_ball) & (~correct_posture)
+    post_hit_contact = contact & has_hit_ball
+    wrong_hit = pre_hit_invalid_contact | post_hit_contact
+
+    terminated = height_out_of_range | wrong_hit
+    if episode_length_buf is None or max_episode_length is None:
+        truncated = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    else:
+        truncated = (episode_length_buf >= (max_episode_length - 1)) & (~terminated)
+
+    timeout_without_hit = truncated & (~has_hit_ball)
+    wrong_hit = wrong_hit | timeout_without_hit
+
+    if not return_reason_masks:
+        return terminated, truncated
+
+    reason_masks = {
+        "height_out_of_range": height_out_of_range,
+        "wrong_hit": wrong_hit,
+        "wrong_hit_pre_contact": pre_hit_invalid_contact,
+        "wrong_hit_post_contact": post_hit_contact,
+        "hover_phase_reached": has_hit_ball,
+        "timeout": truncated,
+        "timeout_without_hit": timeout_without_hit,
+    }
+    return terminated, truncated, reason_masks
 
 
 def compute_dones(
