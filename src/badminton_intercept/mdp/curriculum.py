@@ -37,7 +37,7 @@ class CurriculumManager:
                 ball_vel_x_range=(2.0, 4.0),
                 ball_vel_y_range=(-1.0, 1.0),
                 ball_vel_z_range=(2.0, 6.0),
-                uav_init_x_range=(1.0, 3.0),
+                uav_init_x_range=(1.5, 3.0),# 感觉初始坐标为1离得有点近了，先改成1.5试试
                 uav_init_y_range=(-1.0, 1.0),
                 uav_init_z_range=(1.0, 1.5),
                 ball_init_x_range=(-3.0, -2.0),

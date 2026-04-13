@@ -413,6 +413,115 @@ def _patch_runner_log_for_curriculum(runner: OnPolicyRunner, curriculum, freeze_
         logger_obj.log = _curriculum_log
 
 
+def _patch_runner_log_for_task2_product_json(
+    runner: OnPolicyRunner,
+    log_dir: str,
+    threshold: float = 0.85,
+) -> None:
+    """Track task2 metrics and append iteration info to JSON when product improves.
+
+    Rule:
+    1) Start tracking only after both metrics are > threshold.
+    2) After that, whenever metric_a * metric_b exceeds previous best product,
+       append this step information to a JSON file.
+    """
+    logger_obj = getattr(runner, "logger", None)
+    if logger_obj is None:
+        print("[WARN] Runner has no logger. Task2 product JSON tracking disabled.")
+        return
+
+    original_log = None
+    patch_target = None
+    if hasattr(runner, "log"):
+        original_log = runner.log
+        patch_target = "runner"
+    elif hasattr(logger_obj, "log"):
+        original_log = logger_obj.log
+        patch_target = "logger"
+    else:
+        print("[WARN] Could not find log method for task2 product JSON tracking. Disabled.")
+        return
+
+    metric_a_key = "post_hit_server_half_grounded_rate"
+    metric_b_key = "pre_hit_success_hit_rate"
+    json_path = os.path.join(log_dir, "task2_product_improve_steps.json")
+    best_product = float("-inf")
+    threshold_armed = False
+    saved_steps: list[dict[str, float | int]] = []
+
+    def _extract_metric_mean(ep_extras: list, key: str) -> float | None:
+        if not ep_extras:
+            return None
+        values: list[float] = []
+        for info in ep_extras:
+            if not isinstance(info, dict) or key not in info:
+                continue
+            value = info[key]
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    continue
+                values.extend(float(v) for v in value.detach().flatten().cpu().tolist())
+            else:
+                values.append(float(value))
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    def _task2_product_log(*args, **kwargs):
+        nonlocal best_product, threshold_armed, saved_steps
+
+        # Must snapshot before original log clears ep_extras.
+        ep_extras_snapshot = list(getattr(logger_obj, "ep_extras", []))
+        metric_a = _extract_metric_mean(ep_extras_snapshot, metric_a_key)
+        metric_b = _extract_metric_mean(ep_extras_snapshot, metric_b_key)
+        iteration = kwargs.get("it", getattr(runner, "current_learning_iteration", 0))
+
+        result = original_log(*args, **kwargs)
+
+        if metric_a is None or metric_b is None:
+            return result
+
+        if (metric_a > threshold) and (metric_b > threshold):
+            threshold_armed = True
+
+        if not threshold_armed:
+            return result
+
+        product = metric_a * metric_b
+        if product > best_product:
+            best_product = product
+            step_info: dict[str, float | int] = {
+                "iteration": int(iteration),
+                metric_a_key: float(metric_a),
+                metric_b_key: float(metric_b),
+                "product": float(product),
+            }
+            saved_steps.append(step_info)
+            with open(json_path, "w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "threshold": float(threshold),
+                        "metric_a": metric_a_key,
+                        "metric_b": metric_b_key,
+                        "best_product": float(best_product),
+                        "saved_steps": saved_steps,
+                    },
+                    file,
+                    indent=2,
+                )
+            print(
+                "[task2-json] saved improved step: "
+                f"iter={int(iteration)}, {metric_a_key}={metric_a:.4f}, "
+                f"{metric_b_key}={metric_b:.4f}, product={product:.6f}"
+            )
+        return result
+
+    if patch_target == "runner":
+        runner.log = _task2_product_log
+    else:
+        logger_obj.log = _task2_product_log
+
+
 def _save_curriculum_summary(runner: OnPolicyRunner, log_dir: str) -> None:
     logger = getattr(runner, "logger", None)
     if logger is None or not hasattr(logger, "rewbuffer") or len(logger.rewbuffer) == 0:
@@ -664,6 +773,8 @@ def main() -> None:
         args_cli.freeze_curriculum_stage or args_cli.enable_post_hit_tracking or args_cli.enable_serve_hover
     )
     _patch_runner_log_for_curriculum(runner, curriculum, freeze_stage=freeze_curriculum)
+    if args_cli.enable_post_hit_tracking:
+        _patch_runner_log_for_task2_product_json(runner, log_dir=log_dir, threshold=0.85)
 
     if checkpoint_mode == "finetune" and args_cli.reset_action_std is None:
         current_std = _get_policy_action_std_mean(_get_runner_policy(runner))
