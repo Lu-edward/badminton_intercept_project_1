@@ -164,12 +164,8 @@ if ISAACLAB_CFG_AVAILABLE:
         enable_post_hit_tracking: bool = False
         enable_serve_hover: bool = False
         post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
-        serve_hover_target_pos: tuple[float, float, float] = (2.0, 0.0, 1.5)
         serve_hover_min_height: float = 0.1
         serve_hover_max_height: float = 4.0
-        serve_hover_reward_pose: float = 5.0
-        serve_hover_reward_up: float = 1.0
-        serve_hover_reward_spin: float = 0.05
 
 else:
 
@@ -259,12 +255,8 @@ else:
         enable_post_hit_tracking: bool = False
         enable_serve_hover: bool = False
         post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
-        serve_hover_target_pos: tuple[float, float, float] = (2.0, 0.0, 1.5)
         serve_hover_min_height: float = 0.1
         serve_hover_max_height: float = 4.0
-        serve_hover_reward_pose: float = 5.0
-        serve_hover_reward_up: float = 1.0
-        serve_hover_reward_spin: float = 0.05
 
 
 DEFAULT_ENV_CFG = InterceptEnvCfg()

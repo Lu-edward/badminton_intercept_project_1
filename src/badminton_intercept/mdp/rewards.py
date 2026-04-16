@@ -6,6 +6,37 @@ except Exception:
     torch = None
 
 
+def _quat_to_rotmat_wxyz(quat_wxyz: "torch.Tensor") -> "torch.Tensor":
+    """Convert quaternion (w, x, y, z) to rotation matrix."""
+    w = quat_wxyz[:, 0]
+    x = quat_wxyz[:, 1]
+    y = quat_wxyz[:, 2]
+    z = quat_wxyz[:, 3]
+
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    r00 = 1 - 2 * (yy + zz)
+    r01 = 2 * (xy - wz)
+    r02 = 2 * (xz + wy)
+    r10 = 2 * (xy + wz)
+    r11 = 1 - 2 * (xx + zz)
+    r12 = 2 * (yz - wx)
+    r20 = 2 * (xz - wy)
+    r21 = 2 * (yz + wx)
+    r22 = 1 - 2 * (xx + yy)
+
+    return torch.stack(
+        [
+            torch.stack([r00, r01, r02], dim=-1),
+            torch.stack([r10, r11, r12], dim=-1),
+            torch.stack([r20, r21, r22], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
 def compute_rewards(
     racket_pos_w=None,
     ball_pos_w=None,
@@ -346,56 +377,89 @@ def compute_rewards_task2(
 
 
 def compute_rewards_serve_hover(
-    drone_pos_w=None,
+    drone_pos=None,
     drone_up_w=None,
     drone_ang_vel_w=None,
+    drone_quat_w=None,
     has_hit_ball=None,
-    hover_target_pos=(2.0, 0.0, 1.25),
-    c_hover_pose: float = 5.0,
-    c_hover_up: float = 1.0,
-    c_hover_spin: float = 0.05,
+    hover_target_pos=(-2.0, 0.0, 1.25),
 ) -> dict:
     """Compute post-hit hovering rewards.
 
+    All positions are in LOCAL (court) frame.
     The hover policy is only trained after a valid hit. Before that point the
     reward is exactly zero so pre-hit task2 behavior stays frozen.
+
+    Reward formula:
+        heading = body X axis in world frame
+        rheading = [-1, 0, 0] - heading  (期望朝向 -x)
+        distance = L2(concat(rpos_hover, rheading))
+        reward_pose = 1.0 / (1.0 + (1.2 * distance)^2)
+        reward_up = ((up_z + 1) / 2)^2
+        reward_spin = 1.0 / (1.0 + ang_z^2)
+        reward_hover = 3.0 * (reward_pose + reward_pose * (reward_up + reward_spin))
     """
-    if torch is None or drone_pos_w is None:
+    if torch is None or drone_pos is None:
         return {
             "total": 0.0,
+            "reward_hover": 0.0,
             "reward_pose": 0.0,
             "reward_up": 0.0,
             "reward_spin": 0.0,
         }
 
-    batch_size = drone_pos_w.shape[0]
-    device = drone_pos_w.device
-    dtype = drone_pos_w.dtype
+    batch_size = drone_pos.shape[0]
+    device = drone_pos.device
+    dtype = drone_pos.dtype
     if has_hit_ball is None:
         has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     active = has_hit_ball.float()
-    target = torch.tensor(hover_target_pos, dtype=dtype, device=device).unsqueeze(0).expand(batch_size, -1)
 
-    dist = torch.linalg.norm(drone_pos_w - target, dim=-1)
-    reward_pose = c_hover_pose / (1.0 + dist)
-    reward_pose = reward_pose * active
+    # heading = body X axis in world frame (first column of rotmat)
+    if drone_quat_w is not None:
+        rotmat = _quat_to_rotmat_wxyz(drone_quat_w).reshape(batch_size, 9)
+        heading = torch.stack([rotmat[:, 0], rotmat[:, 3], rotmat[:, 6]], dim=-1)
+    else:
+        heading = torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
-    if drone_up_w is None:
+    target_heading = torch.tensor([-1.0, 0.0, 0.0], dtype=dtype, device=device)
+    rheading = target_heading - heading
+
+    # rpos_hover
+    target_pos = torch.tensor(hover_target_pos, dtype=dtype, device=device).unsqueeze(0).expand(batch_size, -1)
+    rpos_hover = drone_pos - target_pos
+
+    # 6D L2 distance: concat position error + heading error
+    combined = torch.cat([rpos_hover, rheading], dim=-1)
+    distance = torch.linalg.norm(combined, dim=-1)
+
+    # reward_pose
+    reward_pose = 1.0 / (1.0 + (1.2 * distance) ** 2)
+
+    # reward_up
+    if drone_up_w is not None:
+        up_z = drone_up_w[:, 2]
+        reward_up = ((up_z + 1.0) / 2.0) ** 2
+    else:
         reward_up = torch.zeros(batch_size, device=device, dtype=dtype)
-    else:
-        reward_up = c_hover_up * torch.clamp(drone_up_w[:, 2], min=0.0, max=1.0) * active
 
-    if drone_ang_vel_w is None:
+    # reward_spin (only z-axis angular velocity)
+    if drone_ang_vel_w is not None:
+        ang_z = drone_ang_vel_w[:, 2]
+        reward_spin = 1.0 / (1.0 + ang_z ** 2)
+    else:
         reward_spin = torch.zeros(batch_size, device=device, dtype=dtype)
-    else:
-        reward_spin = -c_hover_spin * torch.linalg.norm(drone_ang_vel_w, dim=-1) * active
 
-    total = reward_pose + reward_up + reward_spin
-    total = torch.nan_to_num(total, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
+    # 综合 hover 奖励
+    reward_hover = 3.0 * (reward_pose + reward_pose * (reward_up + reward_spin))
+    reward_hover = reward_hover * active
+
+    total = torch.nan_to_num(reward_hover, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
     return {
         "total": total,
-        "reward_pose": reward_pose,
-        "reward_up": reward_up,
-        "reward_spin": reward_spin,
+        "reward_hover": reward_hover,
+        "reward_pose": reward_pose * active,
+        "reward_up": reward_up * active,
+        "reward_spin": reward_spin * active,
     }

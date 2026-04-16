@@ -135,6 +135,7 @@ def compute_dones_serve_hover(
     contact=None,
     has_hit_ball=None,
     correct_posture=None,
+    drone_net_collision=None,
     episode_length_buf=None,
     max_episode_length: int | None = None,
     min_height: float = 0.1,
@@ -143,14 +144,15 @@ def compute_dones_serve_hover(
 ):
     """Termination logic for serve-hover training.
 
-    Only three conditions remain active:
+    Active termination conditions:
     - drone height out of range
-    - wrong_hit
+    - wrong_hit (pre-hit invalid contact or post-hit contact)
+    - drone_net_collision (drone body hits net after ball is hit)
     - timeout
     """
     if torch is None or drone_pos_w is None:
         if return_reason_masks:
-            return False, False, {}
+            return False, False, {}, 0.0
         return False, False
 
     device = drone_pos_w.device
@@ -162,6 +164,8 @@ def compute_dones_serve_hover(
         has_hit_ball = torch.zeros(num_envs, dtype=torch.bool, device=device)
     if correct_posture is None:
         correct_posture = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    if drone_net_collision is None:
+        drone_net_collision = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     low_height = (
         drone_bottom_z < min_height
@@ -175,7 +179,10 @@ def compute_dones_serve_hover(
     post_hit_contact = contact & has_hit_ball
     wrong_hit = pre_hit_invalid_contact | post_hit_contact
 
-    terminated = height_out_of_range | wrong_hit
+    # drone-net collision: only counts after ball is hit
+    net_collision = drone_net_collision & has_hit_ball
+
+    terminated = height_out_of_range | wrong_hit | net_collision
     if episode_length_buf is None or max_episode_length is None:
         truncated = torch.zeros(num_envs, dtype=torch.bool, device=device)
     else:
@@ -185,7 +192,7 @@ def compute_dones_serve_hover(
     wrong_hit = wrong_hit | timeout_without_hit
 
     if not return_reason_masks:
-        return terminated, truncated
+        return terminated, truncated, torch.zeros(num_envs, device=device)
 
     reason_masks = {
         "height_out_of_range": height_out_of_range,
@@ -195,8 +202,18 @@ def compute_dones_serve_hover(
         "hover_phase_reached": has_hit_ball,
         "timeout": truncated,
         "timeout_without_hit": timeout_without_hit,
+        "drone_net_collision": net_collision,
     }
-    return terminated, truncated, reason_masks
+
+    # reward_end: -10 when terminated and drone crashed (z < 0.3)
+    crash = drone_pos_w[:, 2] < 0.3
+    extra_termination_rewards = torch.where(
+        terminated & crash,
+        torch.full((num_envs,), -10.0, dtype=drone_pos_w.dtype, device=device),
+        torch.zeros((num_envs,), dtype=drone_pos_w.dtype, device=device),
+    )
+
+    return terminated, truncated, reason_masks, extra_termination_rewards
 
 
 def compute_dones(

@@ -126,6 +126,7 @@ class InterceptEnv(DirectRLEnv):
         self.post_hit = None
         self._just_entered_post_hit = None
         self._serve_hover_target_pos = None
+        self._serve_hover_termination_rewards = None
         self._hit_drone_pos_w = None
         self._hit_drone_quat_w = None
         self._hit_drone_lin_vel_w = None
@@ -149,7 +150,7 @@ class InterceptEnv(DirectRLEnv):
 
         if torch is not None:
             self._serve_hover_target_pos = torch.tensor(
-                getattr(cfg, "serve_hover_target_pos", (2.0, 0.0, 1.5)),
+                (-2.0, 0.0, 1.25),
                 dtype=torch.float32,
             )
 
@@ -1029,17 +1030,19 @@ class InterceptEnv(DirectRLEnv):
                 ball_pos_local = ball_pos_w - self.scene.env_origins
 
             if self.enable_serve_hover:
+                hover_target = self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype)
                 rewards = compute_rewards_serve_hover(
-                    drone_pos_w=drone_pos_local,
+                    drone_pos=drone_pos_local,
                     drone_up_w=drone_up_w,
                     drone_ang_vel_w=drone_ang_vel_w,
+                    drone_quat_w=drone_quat_w,
                     has_hit_ball=self.post_hit,
-                    hover_target_pos=getattr(self.cfg, "serve_hover_target_pos", (2.0, 0.0, 1.5)),
-                    c_hover_pose=float(getattr(self.cfg, "serve_hover_reward_pose", 5.0)),
-                    c_hover_up=float(getattr(self.cfg, "serve_hover_reward_up", 1.0)),
-                    c_hover_spin=float(getattr(self.cfg, "serve_hover_reward_spin", 0.05)),
+                    hover_target_pos=hover_target,
                 )
-                return rewards["total"]
+                total_reward = rewards["total"]
+                if self._serve_hover_termination_rewards is not None:
+                    total_reward = total_reward + self._serve_hover_termination_rewards
+                return total_reward
 
             # 任务二模式：使用 compute_rewards_task2
             if self.enable_post_hit_tracking:
@@ -1127,12 +1130,14 @@ class InterceptEnv(DirectRLEnv):
                 correct_posture = normal_x < 0.0
                 just_entered_post_hit = self._just_entered_post_hit if self._just_entered_post_hit is not None else torch.zeros_like(contact)
                 contact_for_hover = contact & (~just_entered_post_hit)
-                terminated, truncated, reason_masks = compute_dones_serve_hover(
+
+                terminated, truncated, reason_masks, extra_term_rewards = compute_dones_serve_hover(
                     drone_pos_w=drone_pos_local,
                     drone_bottom_z=drone_bottom_z,
                     contact=contact_for_hover,
                     has_hit_ball=self.post_hit,
                     correct_posture=correct_posture,
+                    drone_net_collision=net_contact,
                     episode_length_buf=self.episode_length_buf,
                     max_episode_length=self.max_episode_length,
                     min_height=float(getattr(self.cfg, "serve_hover_min_height", 0.1)),
@@ -1140,6 +1145,7 @@ class InterceptEnv(DirectRLEnv):
                     return_reason_masks=True,
                 )
                 self._last_done_reasons = reason_masks
+                self._serve_hover_termination_rewards = extra_term_rewards
             # 任务二模式：post-hit 阶段使用新的 termination 逻辑
             elif self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
                 from badminton_intercept.mdp.terminations import compute_dones_task2
@@ -1230,64 +1236,118 @@ class InterceptEnv(DirectRLEnv):
                 num_resets = int((terminated | truncated).sum().item())
                 if num_resets > 0:
                     done_mask = terminated | truncated
-                    # Keep only two grouped views in logs:
-                    # 1) post-hit internal termination taxonomy (sum to 1 within post-hit done episodes)
-                    # 2) pre-hit termination taxonomy including success-hit (sum to 1 within pre-hit done episodes)
-                    summary = {}
 
-                    zero_mask = torch.zeros_like(done_mask)
-                    if self.post_hit is not None:
-                        post_hit_done_mask = done_mask & self.post_hit
+                    if self.enable_serve_hover:
+                        # ============================================================
+                        # Serve Hover 日志（与 task2 日志完全独立）
+                        # reason_masks keys from compute_dones_serve_hover:
+                        #   height_out_of_range, wrong_hit, wrong_hit_pre_contact,
+                        #   wrong_hit_post_contact, hover_phase_reached, timeout,
+                        #   timeout_without_hit
+                        # ============================================================
+                        summary = {}
+                        zero_mask = torch.zeros_like(done_mask)
+
+                        # Post-hit 阶段结束且有 hover 记录的 env 数量
+                        hover_reached_mask = reason_masks.get("hover_phase_reached", zero_mask)
+                        post_hit_done_mask = done_mask & hover_reached_mask
+                        post_hit_done_count = int(post_hit_done_mask.sum().item())
+                        hover_reached_count = int((done_mask & hover_reached_mask).sum().item())
+
+                        # Post-hit 阶段内的终止原因
+                        height_out = reason_masks.get("height_out_of_range", zero_mask)
+                        wrong_hit_mask = reason_masks.get("wrong_hit", zero_mask)
+                        timeout_mask = reason_masks.get("timeout", zero_mask)
+                        drone_net_collision_mask = reason_masks.get("drone_net_collision", zero_mask)
+
+                        height_out_count = int((post_hit_done_mask & height_out).sum().item())
+                        wrong_hit_count = int((post_hit_done_mask & wrong_hit_mask).sum().item())
+                        timeout_count = int((post_hit_done_mask & timeout_mask).sum().item())
+                        drone_net_collision_count = int((post_hit_done_mask & drone_net_collision_mask).sum().item())
+
+                        wrong_pre_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_pre_contact", zero_mask)).sum().item())
+                        wrong_post_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_post_contact", zero_mask)).sum().item())
+
+                        # 分母为 post-hit 阶段结束的 env 数量
+                        if post_hit_done_count > 0:
+                            denom = float(post_hit_done_count)
+                        else:
+                            denom = 1.0  # 避免除零
+
+                        summary["serve_hover_height_out_rate"] = float(height_out_count / denom)
+                        summary["serve_hover_wrong_hit_rate"] = float(wrong_hit_count / denom)
+                        summary["serve_hover_timeout_rate"] = float(timeout_count / denom)
+                        summary["serve_hover_drone_net_collision_rate"] = float(drone_net_collision_count / denom)
+
+                        # 错误击球细分
+                        summary["serve_hover_wrong_hit_pre_rate"] = float(wrong_pre_count / denom)
+                        summary["serve_hover_wrong_hit_post_rate"] = float(wrong_post_count / denom)
+
+                        # pre_hit_success_hit_rate（分母为所有结束 episodes）
+                        summary["pre_hit_success_hit_rate"] = float(hover_reached_count / num_resets)
+
+                        current_stage = self._curriculum.current_stage
+                        summary["curriculum_stage_id"] = current_stage.stage_id
+                        self.extras["episode"] = summary
                     else:
-                        post_hit_done_mask = zero_mask
-                    pre_hit_done_mask = done_mask & (~post_hit_done_mask)
-                    post_hit_done_count = int(post_hit_done_mask.sum().item())
-                    pre_hit_done_count = int(pre_hit_done_mask.sum().item())
-                    # Build exclusive post-hit categories with precedence + unknown fallback.
-                    if post_hit_done_count > 0:
-                        post_hit_remaining = post_hit_done_mask.clone()
-                        post_hit_category_masks = (
-                            ("post_hit_net_contact_rate", reason_masks.get("net_contact", zero_mask)),
-                            ("post_hit_ball_too_high_rate", reason_masks.get("ball_too_high", zero_mask)),
-                            ("post_hit_drone_half_grounded_rate", reason_masks.get("drone_half_grounded", zero_mask)),
-                            ("post_hit_server_half_grounded_rate", reason_masks.get("server_half_grounded", zero_mask)),
-                            ("post_hit_drone_half_out_rate", reason_masks.get("drone_half_out", zero_mask)),
-                            ("post_hit_server_half_out_rate", reason_masks.get("server_half_out", zero_mask)),
+                        # ============================================================
+                        # Task2 / Task1 日志（原有逻辑，不受影响）
+                        # ============================================================
+                        summary = {}
+
+                        zero_mask = torch.zeros_like(done_mask)
+                        if self.post_hit is not None:
+                            post_hit_done_mask = done_mask & self.post_hit
+                        else:
+                            post_hit_done_mask = zero_mask
+                        pre_hit_done_mask = done_mask & (~post_hit_done_mask)
+                        post_hit_done_count = int(post_hit_done_mask.sum().item())
+                        pre_hit_done_count = int(pre_hit_done_mask.sum().item())
+                        # Build exclusive post-hit categories with precedence + unknown fallback.
+                        if post_hit_done_count > 0:
+                            post_hit_remaining = post_hit_done_mask.clone()
+                            post_hit_category_masks = (
+                                ("post_hit_net_contact_rate", reason_masks.get("net_contact", zero_mask)),
+                                ("post_hit_ball_too_high_rate", reason_masks.get("ball_too_high", zero_mask)),
+                                ("post_hit_drone_half_grounded_rate", reason_masks.get("drone_half_grounded", zero_mask)),
+                                ("post_hit_server_half_grounded_rate", reason_masks.get("server_half_grounded", zero_mask)),
+                                ("post_hit_drone_half_out_rate", reason_masks.get("drone_half_out", zero_mask)),
+                                ("post_hit_server_half_out_rate", reason_masks.get("server_half_out", zero_mask)),
+                            )
+                            for metric_name, reason_mask in post_hit_category_masks:
+                                category_mask = post_hit_remaining & reason_mask
+                                category_count = int(category_mask.sum().item())
+                                summary[metric_name] = float(category_count / post_hit_done_count)
+                                post_hit_remaining = post_hit_remaining & (~reason_mask)
+
+                        # Pre-hit success means the episode made it into post-hit.
+                        # Therefore its count should match the total number of post-hit-completed episodes.
+                        summary["pre_hit_success_hit_rate"] = float(post_hit_done_count / num_resets)
+
+                        # Build exclusive pre-hit failure categories with precedence.
+                        # Normalize them by all completed episodes so the pre-hit success/failure
+                        # rates live on the same denominator and sum to ~1 together.
+                        pre_hit_remaining = pre_hit_done_mask.clone()
+                        pre_hit_category_masks = (
+                            ("pre_hit_failure_net_contact_rate", reason_masks.get("failure_net_contact", zero_mask)),
+                            ("pre_hit_failure_server_side_grounded_rate", reason_masks.get("failure_server_side_grounded", zero_mask)),
+                            ("pre_hit_failure_ball_drop_rate", reason_masks.get("failure_ball_drop", zero_mask)),
+                            ("pre_hit_failure_out_of_bounds_rate", reason_masks.get("failure_out_of_bounds", zero_mask)),
+                            ("pre_hit_failure_tilt_rate", reason_masks.get("failure_tilt", zero_mask)),
+                            ("pre_hit_timeout_rate", reason_masks.get("timeout", zero_mask)),
                         )
-                        for metric_name, reason_mask in post_hit_category_masks:
-                            category_mask = post_hit_remaining & reason_mask
+                        for metric_name, reason_mask in pre_hit_category_masks:
+                            category_mask = pre_hit_remaining & reason_mask
                             category_count = int(category_mask.sum().item())
-                            summary[metric_name] = float(category_count / post_hit_done_count)
-                            post_hit_remaining = post_hit_remaining & (~reason_mask)
-
-                    # Pre-hit success means the episode made it into post-hit.
-                    # Therefore its count should match the total number of post-hit-completed episodes.
-                    summary["pre_hit_success_hit_rate"] = float(post_hit_done_count / num_resets)
-
-                    # Build exclusive pre-hit failure categories with precedence.
-                    # Normalize them by all completed episodes so the pre-hit success/failure
-                    # rates live on the same denominator and sum to ~1 together.
-                    pre_hit_remaining = pre_hit_done_mask.clone()
-                    pre_hit_category_masks = (
-                        ("pre_hit_failure_net_contact_rate", reason_masks.get("failure_net_contact", zero_mask)),
-                        ("pre_hit_failure_server_side_grounded_rate", reason_masks.get("failure_server_side_grounded", zero_mask)),
-                        ("pre_hit_failure_ball_drop_rate", reason_masks.get("failure_ball_drop", zero_mask)),
-                        ("pre_hit_failure_out_of_bounds_rate", reason_masks.get("failure_out_of_bounds", zero_mask)),
-                        ("pre_hit_failure_tilt_rate", reason_masks.get("failure_tilt", zero_mask)),
-                        ("pre_hit_timeout_rate", reason_masks.get("timeout", zero_mask)),
-                    )
-                    for metric_name, reason_mask in pre_hit_category_masks:
-                        category_mask = pre_hit_remaining & reason_mask
-                        category_count = int(category_mask.sum().item())
-                        summary[metric_name] = float(category_count / num_resets)
-                        pre_hit_remaining = pre_hit_remaining & (~reason_mask)
-                    # Backward-compatible key used by some log/curriculum pipelines.
-                    summary["success_rate"] = summary["pre_hit_success_hit_rate"]
-                    # 添加课程学习阶段信息
-                    current_stage = self._curriculum.current_stage
-                    summary["curriculum_stage_id"] = current_stage.stage_id
-                    # RSL-RL logger 只读取 extras["episode"] 或 extras["log"]
-                    self.extras["episode"] = summary
+                            summary[metric_name] = float(category_count / num_resets)
+                            pre_hit_remaining = pre_hit_remaining & (~reason_mask)
+                        # Backward-compatible key used by some log/curriculum pipelines.
+                        summary["success_rate"] = summary["pre_hit_success_hit_rate"]
+                        # 添加课程学习阶段信息
+                        current_stage = self._curriculum.current_stage
+                        summary["curriculum_stage_id"] = current_stage.stage_id
+                        # RSL-RL logger 只读取 extras["episode"] 或 extras["log"]
+                        self.extras["episode"] = summary
                 else:
                     # 没有 env 结束时，清除 episode 统计避免被错误平均
                     if "episode" in self.extras:

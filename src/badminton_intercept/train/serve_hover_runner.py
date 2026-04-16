@@ -66,16 +66,32 @@ OnPolicyRunner = _resolve_rsl_symbol(
     ),
 )
 
-Logger = _resolve_rsl_symbol(
-    "rsl_rl",
-    "Logger",
-    (
-        "rsl_rl.utils",
-        "rsl_rl.utils.logger",
-        "rsl_rl.runners",
-        "rsl_rl.runners.logger",
-    ),
-)
+class _NoOpLogger:
+    """Fallback for rsl_rl versions that no longer expose a Logger class."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.log_dir = kwargs.get("log_dir", None)
+
+    def __getattr__(self, name: str):
+        def _noop(*args, **kwargs):
+            return None
+
+        return _noop
+
+
+try:
+    Logger = _resolve_rsl_symbol(
+        "rsl_rl",
+        "Logger",
+        (
+            "rsl_rl.utils",
+            "rsl_rl.utils.logger",
+            "rsl_rl.runners",
+            "rsl_rl.runners.logger",
+        ),
+    )
+except ImportError:
+    Logger = _NoOpLogger
 
 
 class EmpiricalNormalization(nn.Module):
@@ -644,14 +660,27 @@ class ServeHoverMaskedPPO(PPO):
         actor_model = ServeHoverActorAdapter(policy)
         critic_model = ServeHoverCriticAdapter(policy)
 
+        ppo_signature = inspect.signature(PPO.__init__)
+        ppo_param_names = [name for name in ppo_signature.parameters.keys() if name != "self"]
+        ppo_accepts_storage = "storage" in ppo_signature.parameters
+        ppo_uses_split_actor_critic = (
+            len(ppo_param_names) >= 2
+            and ppo_param_names[0] in {"actor", "actor_model"}
+            and ppo_param_names[1] in {"critic", "critic_model"}
+        )
+        if storage is not None and ppo_accepts_storage:
+            kwargs["storage"] = storage
+
         filtered_kwargs, dropped_keys = _filter_kwargs_for_callable(PPO.__init__, kwargs)
         if dropped_keys:
             print("ServeHoverMaskedPPO dropped unsupported PPO kwargs: " + str(sorted(dropped_keys)))
 
-        if storage is not None:
-            super().__init__(actor_model, critic_model, storage, *args, **filtered_kwargs)
-        else:
+        if ppo_uses_split_actor_critic:
             super().__init__(actor_model, critic_model, *args, **filtered_kwargs)
+        else:
+            super().__init__(policy, *args, **filtered_kwargs)
+        if storage is not None and not ppo_accepts_storage:
+            self.storage = storage
 
         self.policy = policy
         self.actor = actor_model
