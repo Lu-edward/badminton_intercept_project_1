@@ -44,6 +44,8 @@ class LaunchSamplingSpec:
     use_near_net_init_x: bool
     center_ball_init_z_on_net: bool
     z_half_span_m: float
+    landing_x_range: tuple[float, float] | None = None
+    landing_y_range: tuple[float, float] | None = None
 
 
 def get_curriculum_stages() -> list[CurriculumStage]:
@@ -128,6 +130,9 @@ def build_launch_sampling_spec(cfg: Any, stage: CurriculumStage) -> LaunchSampli
     drag_length_range = tuple(float(v) for v in getattr(cfg, "dr_drag_length_range", (3.8, 4.4)))
     hit_plane_z_range = tuple(float(v) for v in getattr(cfg, "launch_hit_plane_z_range", (1.0, 1.5)))
 
+    landing_x_range = getattr(stage, "landing_x_range", None)
+    landing_y_range = getattr(stage, "landing_y_range", None)
+
     return LaunchSamplingSpec(
         stage_id=int(stage.stage_id),
         stage_name=str(stage.name),
@@ -151,6 +156,8 @@ def build_launch_sampling_spec(cfg: Any, stage: CurriculumStage) -> LaunchSampli
         use_near_net_init_x=use_near_net_init_x,
         center_ball_init_z_on_net=center_ball_init_z_on_net,
         z_half_span_m=z_half_span_m,
+        landing_x_range=landing_x_range,
+        landing_y_range=landing_y_range,
     )
 
 
@@ -285,14 +292,24 @@ def evaluate_launch_candidates(
 
     x_min = 0.0 + spec.x_margin
     x_max = spec.court_length - spec.x_margin
+    y_min = -spec.court_width * 0.5 + spec.y_margin
     y_max = spec.court_width * 0.5 - spec.y_margin
+
+    if spec.landing_x_range is not None:
+        lx_lo, lx_hi = spec.landing_x_range
+        x_min = max(x_min, lx_lo)
+        x_max = min(x_max, lx_hi)
+    if spec.landing_y_range is not None:
+        ly_lo, ly_hi = spec.landing_y_range
+        y_min = max(y_min, min(ly_lo, ly_hi))
+        y_max = min(y_max, max(ly_lo, ly_hi))
 
     net_ok = has_cross & (z_at_net > (spec.net_height + spec.net_margin))
     landing_x = landing_xy[:, 0]
     landing_y = landing_xy[:, 1]
     landing_x_short = has_landing & (landing_x < x_min)
     landing_x_long = has_landing & (landing_x > x_max)
-    landing_y_out = has_landing & (landing_y.abs() > y_max)
+    landing_y_out = has_landing & ((landing_y < y_min) | (landing_y > y_max))
     landing_ok = has_landing & ~(landing_x_short | landing_x_long | landing_y_out)
     hit_plane_ok = hit_plane_data["hit_plane_ok"]
     valid = net_ok & landing_ok & hit_plane_ok
@@ -374,6 +391,8 @@ def build_launch_library_metadata(spec: LaunchSamplingSpec) -> dict[str, Any]:
         "use_near_net_init_x": bool(spec.use_near_net_init_x),
         "center_ball_init_z_on_net": bool(spec.center_ball_init_z_on_net),
         "z_half_span_m": float(spec.z_half_span_m),
+        "landing_x_range": [float(v) for v in spec.landing_x_range] if spec.landing_x_range else None,
+        "landing_y_range": [float(v) for v in spec.landing_y_range] if spec.landing_y_range else None,
     }
 
 

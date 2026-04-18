@@ -18,6 +18,9 @@ class CurriculumStage:
     ball_init_y_range: tuple[float, float] = (-1, 1)
     ball_init_z_range: tuple[float, float] = (1.35, 1.75)
     ball_vel_y_range: tuple[float, float] = (-1.5, 1.5)
+    # stage-specific landing constraints (None = use default court margins)
+    landing_x_range: tuple[float, float] | None = None
+    landing_y_range: tuple[float, float] | None = None
 
 
 class CurriculumManager:
@@ -43,7 +46,8 @@ class CurriculumManager:
                 ball_init_x_range=(-3.0, -2.0),
                 ball_init_y_range=(-1, 1),
                 ball_init_z_range=(1.35, 1.75),
-    
+                landing_x_range=(2.0, 5.0),
+                landing_y_range=(-2.0, 2.0),
             ),
             CurriculumStage(
                 stage_id=2,

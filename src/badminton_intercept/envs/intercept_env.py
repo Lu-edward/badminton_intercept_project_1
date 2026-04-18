@@ -15,6 +15,7 @@ try:
     from isaaclab.assets import Articulation, RigidObject
     from isaaclab.envs import DirectRLEnv
     from isaaclab.sensors import ContactSensor, ContactSensorCfg
+    from isaaclab.sim.schemas import activate_contact_sensors
     from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
     ISAACLAB_RUNTIME_AVAILABLE = True
@@ -81,8 +82,16 @@ class InterceptEnv(DirectRLEnv):
         self._net = None
         self._racket_contact_sensor = None
         self._net_contact_sensor = None
+        self._drone_net_contact_sensor = None
+        self._racket_net_contact_sensor = None
+        self._net_drone_contact_sensor = None
         self._racket_body_ids = None
         self.last_actions = None
+        # Debug counters for contact sensor validation
+        self._debug_drone_net_count = 0
+        self._debug_drone_net_error_printed = False
+        self._debug_drone_net_setup_printed = False
+        self._debug_drone_net_compute_printed = False
 
         # Runtime randomization/state buffers (initialized lazily once env sizes are known).
         self._drag_length_m = None
@@ -116,6 +125,12 @@ class InterceptEnv(DirectRLEnv):
         self._force_body_ids = None
         self._last_done_reasons = None
         self._last_launch_stats = {}
+        self._last_sensor_hit = None
+        self._last_geometric_hit = None
+        self._last_weak_hit_failure = None
+        self._pending_weak_hit = None
+        self._pending_weak_hit_age = None
+        self._weak_hit_termination_rewards = None
         # 扫掠接触检测缓冲区
         self._prev_ball_pos_w = None
         self._prev_ball_lin_vel_w = None
@@ -207,13 +222,73 @@ class InterceptEnv(DirectRLEnv):
         if self.device == "cpu" and ground_spawned:
             self.scene.filter_collisions(global_prim_paths=["/World/ground"])
 
-        # Get the contact sensor from the scene (it's automatically created from cfg)
+        self._activate_contact_reporters()
+
+        # This environment manually creates scene assets in _setup_scene(), so the
+        # ContactSensorCfg fields on InterceptEnvCfg are not picked up by InteractiveScene.
+        # Register them here after drone/net/shuttlecock prims have been spawned and cloned.
+        for sensor_name in (
+            "contact_sensor",
+            "net_contact_sensor",
+            "drone_net_contact_sensor",
+            "net_drone_contact_sensor",
+        ):
+            sensor_cfg = getattr(self.cfg, sensor_name, None)
+            if sensor_cfg is not None and sensor_name not in self.scene.sensors:
+                self.scene.sensors[sensor_name] = ContactSensor(sensor_cfg)
+
+        # Get the contact sensors from the scene.
         self._racket_contact_sensor = self.scene.sensors.get("contact_sensor", None)
         self._net_contact_sensor = self.scene.sensors.get("net_contact_sensor", None)
+        self._drone_net_contact_sensor = self.scene.sensors.get("drone_net_contact_sensor", None)
+        self._racket_net_contact_sensor = self.scene.sensors.get("racket_net_contact_sensor", None)
+        self._net_drone_contact_sensor = self.scene.sensors.get("net_drone_contact_sensor", None)
         self._racket_body_ids = None
+        if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+            print(f"[DEBUG] scene sensor keys={list(self.scene.sensors.keys())}")
+            print(
+                "[DEBUG] contact sensors: "
+                f"racket_ball={self._racket_contact_sensor is not None}, "
+                f"shuttle_net={self._net_contact_sensor is not None}, "
+                f"drone={self._drone_net_contact_sensor is not None}, "
+                f"racket={self._racket_net_contact_sensor is not None}, "
+                f"net={self._net_drone_contact_sensor is not None}"
+            )
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _activate_contact_reporters(self):
+        """Ensure PhysX contact reporter API exists before ContactSensor initialization."""
+        if not ISAACLAB_RUNTIME_AVAILABLE:
+            return
+
+        prim_path_exprs = (
+            "/World/envs/env_.*/Drone",
+            "/World/envs/env_.*/ShuttlecockProxy",
+            "/World/envs/env_.*/Net",
+        )
+        activated_count = 0
+        for prim_path_expr in prim_path_exprs:
+            try:
+                prim_paths = sim_utils.find_matching_prim_paths(prim_path_expr)
+            except Exception as exc:
+                print(f"[warn] contact reporter path lookup failed for '{prim_path_expr}': {exc}")
+                continue
+
+            if len(prim_paths) == 0:
+                print(f"[warn] contact reporter path lookup found no prims for '{prim_path_expr}'.")
+                continue
+
+            for prim_path in prim_paths:
+                try:
+                    activate_contact_sensors(prim_path, threshold=0.0)
+                    activated_count += 1
+                except Exception as exc:
+                    print(f"[warn] contact reporter activation skipped for '{prim_path}': {exc}")
+
+        if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+            print(f"[DEBUG] contact reporter activation attempted on {activated_count} prim roots")
 
     def _resolve_force_body_ids(self):
         if self._drone is None or not hasattr(self._drone, "find_bodies"):
@@ -384,6 +459,12 @@ class InterceptEnv(DirectRLEnv):
         self._launch_hit_time_s = torch.zeros((self.num_envs,), device=self.device)
         self._launch_hit_point_local = torch.zeros((self.num_envs, 3), device=self.device)
         self._last_contact = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._last_sensor_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._last_geometric_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._last_weak_hit_failure = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._pending_weak_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._pending_weak_hit_age = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self._weak_hit_termination_rewards = torch.zeros((self.num_envs,), device=self.device)
 
         self._air_params = load_air_yaml_params(self._resolve_air_yaml_path())
         ap = self._air_params
@@ -596,8 +677,10 @@ class InterceptEnv(DirectRLEnv):
         d_axis = torch.minimum(instant_dist, swept_dist)
 
         sensor_contact = torch.zeros_like(geometric_contact)
+        sensor_max_force = torch.zeros_like(geometric_contact, dtype=torch.float32)
 
-        if self._racket_contact_sensor is None:
+        has_racket_sensor = self._racket_contact_sensor is not None
+        if not has_racket_sensor:
             candidate_contact = geometric_contact
         else:
             try:
@@ -605,17 +688,17 @@ class InterceptEnv(DirectRLEnv):
                 force_matrix_hist = getattr(self._racket_contact_sensor.data, "force_matrix_w_history", None)
                 if force_matrix_hist is not None:
                     sensor_force_mag = torch.norm(force_matrix_hist, dim=-1)  # (N, H, B, F)
+                    sensor_max_force = sensor_force_mag.max(dim=1)[0].max(dim=1)[0].max(dim=1)[0]
                     sensor_contact = sensor_force_mag.max(dim=1)[0].max(dim=1)[0].max(dim=1)[0] > threshold
                 else:
                     net_forces_hist = getattr(self._racket_contact_sensor.data, "net_forces_w_history", None)
                     if net_forces_hist is not None:
-                        if self._racket_body_ids is None or int(self._racket_body_ids.numel()) == 0:
-                            force_mag = torch.norm(net_forces_hist, dim=-1)  # (N, H, B)
-                        else:
-                            force_mag = torch.norm(net_forces_hist[:, :, self._racket_body_ids, :], dim=-1)  # (N, H, Br)
+                        force_mag = torch.norm(net_forces_hist, dim=-1)  # (N, H, sensor bodies)
+                        sensor_max_force = force_mag.max(dim=1)[0].max(dim=1)[0]
                         sensor_contact = force_mag.max(dim=1)[0].max(dim=1)[0] > threshold
             except Exception:
                 sensor_contact = torch.zeros_like(geometric_contact)
+            # Always use sensor OR geometric contact; weak_hit logic is disabled
             candidate_contact = sensor_contact | geometric_contact
 
         velocity_confirmed = self._compute_hit_velocity_confirmation(
@@ -624,6 +707,103 @@ class InterceptEnv(DirectRLEnv):
             sensor_contact=sensor_contact,
         )
         contact = candidate_contact & velocity_confirmed
+
+        prev_weak_hit_failure = (
+            self._last_weak_hit_failure.clone()
+            if self._last_weak_hit_failure is not None
+            else torch.zeros_like(contact)
+        )
+        weak_hit_failure = torch.zeros_like(contact)
+        weak_hit_failure_start_steps = torch.zeros_like(contact, dtype=torch.long)
+        if self.enable_post_hit_tracking and self.post_hit is not None:
+            from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
+
+            _, drone_quat_w_for_hit, _, _ = self._get_drone_kinematics()
+            normal_x_for_hit = compute_racket_normal_x_component(drone_quat_w_for_hit)
+            correct_posture_for_hit = normal_x_for_hit < 0.0
+            pre_hit_mask = ~self.post_hit
+            weak_hit_candidate = (
+                geometric_contact
+                & (~sensor_contact)
+                & velocity_confirmed
+                & correct_posture_for_hit
+                & pre_hit_mask
+                & has_racket_sensor
+            )
+            sensor_hit = sensor_contact & correct_posture_for_hit & pre_hit_mask
+            if self._pending_weak_hit is not None and self._pending_weak_hit_age is not None:
+                pending_sensor_hit = self._pending_weak_hit & sensor_hit
+                contact = contact | pending_sensor_hit
+                cancel_pending = self._pending_weak_hit & (sensor_hit | self.post_hit)
+                self._pending_weak_hit[cancel_pending] = False
+                self._pending_weak_hit_age[cancel_pending] = 0
+
+                new_pending = weak_hit_candidate & (~self._pending_weak_hit)
+                self._pending_weak_hit[new_pending] = True
+                self._pending_weak_hit_age[new_pending] = int(self.common_step_counter)
+                if new_pending.any() and bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+                    env_id = int(torch.nonzero(new_pending, as_tuple=False)[0].item())
+                    print(
+                        "[DEBUG] weak_hit_pending_enter: "
+                        f"env={env_id}, step={int(self.common_step_counter)}, "
+                        f"sensor={bool(sensor_contact[env_id].item())}, "
+                        f"geom={bool(geometric_contact[env_id].item())}, "
+                        f"instant_dist={float(instant_dist[env_id].item()):.4f}, "
+                        f"swept_dist={float(swept_dist[env_id].item()):.4f}, "
+                        f"racket_ball_force={float(sensor_max_force[env_id].item()):.4f}"
+                    )
+
+                active_pending = self._pending_weak_hit & pre_hit_mask & (~sensor_hit)
+                grace_steps = int(getattr(self.cfg, "weak_hit_sensor_grace_steps", 4))
+                pending_elapsed_steps = int(self.common_step_counter) - self._pending_weak_hit_age
+                weak_hit_failure = active_pending & (pending_elapsed_steps >= max(grace_steps, 0))
+                weak_hit_failure_start_steps = torch.where(
+                    weak_hit_failure,
+                    self._pending_weak_hit_age,
+                    weak_hit_failure_start_steps,
+                )
+                self._pending_weak_hit[weak_hit_failure] = False
+                self._pending_weak_hit_age[weak_hit_failure] = 0
+            else:
+                weak_hit_failure = weak_hit_candidate
+                weak_hit_failure_start_steps = torch.where(
+                    weak_hit_failure,
+                    torch.full_like(weak_hit_failure_start_steps, int(self.common_step_counter)),
+                    weak_hit_failure_start_steps,
+                )
+
+        newly_weak_hit_failure = weak_hit_failure & (~prev_weak_hit_failure)
+        weak_hit_failure = weak_hit_failure | prev_weak_hit_failure
+
+        self._last_sensor_hit = sensor_contact & velocity_confirmed
+        self._last_geometric_hit = geometric_contact & velocity_confirmed
+        self._last_weak_hit_failure = weak_hit_failure
+
+        if newly_weak_hit_failure.any() and bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+            env_id = int(torch.nonzero(newly_weak_hit_failure, as_tuple=False)[0].item())
+            delta_vn = torch.zeros_like(contact, dtype=torch.float32)
+            if (
+                ball_lin_vel_w is not None
+                and racket_normal_w is not None
+                and self._prev_ball_lin_vel_w is not None
+                and self._prev_racket_normal_w is not None
+            ):
+                normal_ref = self._prev_racket_normal_w
+                normal_ref = normal_ref / torch.linalg.norm(normal_ref, dim=-1, keepdim=True).clamp_min(1.0e-6)
+                vn_prev = torch.sum(self._prev_ball_lin_vel_w * normal_ref, dim=-1)
+                vn_post = torch.sum(ball_lin_vel_w * normal_ref, dim=-1)
+                delta_vn = torch.abs(vn_post - vn_prev)
+            print(
+                "[DEBUG] weak_hit_failure: "
+                f"env={env_id}, pending_start_step={int(weak_hit_failure_start_steps[env_id].item())}, "
+                f"step={int(self.common_step_counter)}, "
+                f"current_sensor={bool(sensor_contact[env_id].item())}, "
+                f"current_geom={bool(geometric_contact[env_id].item())}, "
+                f"instant_dist={float(instant_dist[env_id].item()):.4f}, "
+                f"swept_dist={float(swept_dist[env_id].item()):.4f}, "
+                f"racket_ball_force={float(sensor_max_force[env_id].item()):.4f}, "
+                f"delta_vn={float(delta_vn[env_id].item()):.4f}"
+            )
 
         # 任务二模式：更新 post-hit 标志并保存 hit 时刻的状态
         # 只有当击球姿态正确（球拍朝向对方场地，normal_x < 0）时才追踪球
@@ -635,6 +815,31 @@ class InterceptEnv(DirectRLEnv):
 
             newly_hit = contact & (~self.post_hit) & correct_posture
             if newly_hit.any():
+                if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+                    env_id = int(torch.nonzero(newly_hit, as_tuple=False)[0].item())
+                    delta_vn = torch.zeros_like(contact, dtype=torch.float32)
+                    if (
+                        ball_lin_vel_w is not None
+                        and racket_normal_w is not None
+                        and self._prev_ball_lin_vel_w is not None
+                        and self._prev_racket_normal_w is not None
+                    ):
+                        normal_ref = self._prev_racket_normal_w
+                        normal_ref = normal_ref / torch.linalg.norm(normal_ref, dim=-1, keepdim=True).clamp_min(1.0e-6)
+                        vn_prev = torch.sum(self._prev_ball_lin_vel_w * normal_ref, dim=-1)
+                        vn_post = torch.sum(ball_lin_vel_w * normal_ref, dim=-1)
+                        delta_vn = torch.abs(vn_post - vn_prev)
+                    print(
+                        "[DEBUG] newly_hit: "
+                        f"env={env_id}, step={int(self.common_step_counter)}, "
+                        f"sensor={bool(sensor_contact[env_id].item())}, "
+                        f"geom={bool(geometric_contact[env_id].item())}, "
+                        f"instant_dist={float(instant_dist[env_id].item()):.4f}, "
+                        f"swept_dist={float(swept_dist[env_id].item()):.4f}, "
+                        f"racket_ball_force={float(sensor_max_force[env_id].item()):.4f}, "
+                        f"delta_vn={float(delta_vn[env_id].item()):.4f}, "
+                        f"normal_x={float(normal_x[env_id].item()):.4f}"
+                    )
                 self.post_hit[newly_hit] = True
                 if self._just_entered_post_hit is not None:
                     self._just_entered_post_hit[newly_hit] = True
@@ -702,6 +907,61 @@ class InterceptEnv(DirectRLEnv):
             pass
 
         return torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+    def _compute_drone_net_contact_signal(self):
+        sensor_contact = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+        threshold = float(getattr(self.cfg, "drone_net_contact_force_threshold", 0.1))
+        if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)) and not self._debug_drone_net_compute_printed:
+            print(
+                "[DEBUG] _compute_drone_net_contact_signal active: "
+                f"threshold={threshold:.6f}, "
+                f"drone_sensor={self._drone_net_contact_sensor is not None}, "
+                f"racket_sensor={self._racket_net_contact_sensor is not None}, "
+                f"net_sensor={self._net_drone_contact_sensor is not None}"
+            )
+            self._debug_drone_net_compute_printed = True
+        for sensor_name, sensor in (
+            ("drone_net_contact_sensor", self._drone_net_contact_sensor),
+            ("racket_net_contact_sensor", self._racket_net_contact_sensor),
+            ("net_drone_contact_sensor", self._net_drone_contact_sensor),
+        ):
+            if sensor is None:
+                continue
+            try:
+                sensor_has_data = False
+                sensor_max_force = 0.0
+
+                force_matrix = getattr(sensor.data, "force_matrix_w", None)
+                if force_matrix is not None:
+                    sensor_has_data = True
+                    force_mag = torch.norm(force_matrix, dim=-1)
+                    sensor_max_force = max(sensor_max_force, float(force_mag.max().item()))
+                    sensor_contact = sensor_contact | (force_mag.max(dim=1)[0].max(dim=1)[0] > threshold)
+
+                net_forces = getattr(sensor.data, "net_forces_w", None)
+                if net_forces is not None:
+                    sensor_has_data = True
+                    force_mag = torch.norm(net_forces, dim=-1)
+                    sensor_max_force = max(sensor_max_force, float(force_mag.max().item()))
+                    sensor_contact = sensor_contact | (force_mag.max(dim=1)[0] > threshold)
+
+                if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+                    step = int(self.common_step_counter)
+                    if step % 100 == 0 or sensor_max_force > threshold:
+                        print(f"[DEBUG] {sensor_name}: max_force={sensor_max_force:.6f}, threshold={threshold:.6f}")
+
+                if not sensor_has_data and not hasattr(self, f"_debug_{sensor_name}_none_printed"):
+                    print(f"[DEBUG] {sensor_name} data has no force_matrix_w or net_forces_w")
+                    setattr(self, f"_debug_{sensor_name}_none_printed", True)
+            except Exception as e:
+                if not bool(getattr(self, "_debug_drone_net_error_printed", False)):
+                    print(f"[DEBUG] {sensor_name} exception: {e}")
+                    self._debug_drone_net_error_printed = True
+
+        if sensor_contact.any() and hasattr(self, '_debug_drone_net_count'):
+            self._debug_drone_net_count += int(sensor_contact.sum())
+        return sensor_contact
 
     def _compute_bound_distance(self, drone_pos_w):
         # Boundaries are defined in each env-local court frame (not global world frame).
@@ -1042,6 +1302,8 @@ class InterceptEnv(DirectRLEnv):
                 total_reward = rewards["total"]
                 if self._serve_hover_termination_rewards is not None:
                     total_reward = total_reward + self._serve_hover_termination_rewards
+                if self._weak_hit_termination_rewards is not None:
+                    total_reward = total_reward + self._weak_hit_termination_rewards
                 return total_reward
 
             # 任务二模式：使用 compute_rewards_task2
@@ -1070,7 +1332,10 @@ class InterceptEnv(DirectRLEnv):
                     c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
                     c_vert_vel=float(getattr(self.cfg, "reward_c_vert_vel", 0.1)),
                 )
-                return rewards["total"]
+                total_reward = rewards["total"]
+                if self._weak_hit_termination_rewards is not None:
+                    total_reward = total_reward + self._weak_hit_termination_rewards
+                return total_reward
 
             # 任务一模式：使用原有奖励函数
             rewards = compute_rewards(
@@ -1110,7 +1375,25 @@ class InterceptEnv(DirectRLEnv):
                 racket_normal_w=racket_normal_w,
             )
             net_contact = self._compute_net_contact_signal()
+            drone_net_contact = self._compute_drone_net_contact_signal()
             self._last_contact = contact.clone()
+            weak_hit_failure = (
+                self._last_weak_hit_failure.clone()
+                if self._last_weak_hit_failure is not None
+                else torch.zeros_like(contact)
+            )
+            pending_weak_hit = (
+                self._pending_weak_hit.clone()
+                if self._pending_weak_hit is not None
+                else torch.zeros_like(contact)
+            )
+            weak_hit_reward = float(getattr(self.cfg, "weak_hit_reward", 5))
+            self._weak_hit_termination_rewards = torch.where(
+                weak_hit_failure,
+                torch.full((self.num_envs,), weak_hit_reward, dtype=ball_pos_w.dtype, device=self.device),
+                torch.zeros((self.num_envs,), dtype=ball_pos_w.dtype, device=self.device),
+            )
+            self._serve_hover_termination_rewards = torch.zeros((self.num_envs,), dtype=ball_pos_w.dtype, device=self.device)
             drone_up_w = self._quat_to_up_axis_w(drone_quat_w)
             drone_pos_local = drone_pos_w
             racket_pos_local = racket_pos_w
@@ -1129,23 +1412,76 @@ class InterceptEnv(DirectRLEnv):
                 normal_x = compute_racket_normal_x_component(drone_quat_w)
                 correct_posture = normal_x < 0.0
                 just_entered_post_hit = self._just_entered_post_hit if self._just_entered_post_hit is not None else torch.zeros_like(contact)
-                contact_for_hover = contact & (~just_entered_post_hit)
+                post_hit_active = self.post_hit & (~just_entered_post_hit)
+                pre_hit_envs = ~post_hit_active
+                terminated = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                truncated = torch.zeros_like(terminated)
+                reason_masks = {}
 
-                terminated, truncated, reason_masks, extra_term_rewards = compute_dones_serve_hover(
-                    drone_pos_w=drone_pos_local,
-                    drone_bottom_z=drone_bottom_z,
-                    contact=contact_for_hover,
-                    has_hit_ball=self.post_hit,
-                    correct_posture=correct_posture,
-                    drone_net_collision=net_contact,
-                    episode_length_buf=self.episode_length_buf,
-                    max_episode_length=self.max_episode_length,
-                    min_height=float(getattr(self.cfg, "serve_hover_min_height", 0.1)),
-                    max_height=float(getattr(self.cfg, "serve_hover_max_height", 4.0)),
-                    return_reason_masks=True,
-                )
+                # Debug: log drone_net_contact and has_hit_ball status
+                drone_net_contact_for_hover = drone_net_contact & post_hit_active
+                if hasattr(self, '_debug_drone_net_count') and int(drone_net_contact_for_hover.sum()) > 0:
+                    print(
+                        "[DEBUG] drone_net_contact detected: "
+                        f"{int(drone_net_contact_for_hover.sum())}, post_hit_active={int(post_hit_active.sum())}"
+                    )
+
+                if post_hit_active.any():
+                    terminated_post, truncated_post, reason_masks_post, extra_term_rewards_post = compute_dones_serve_hover(
+                        drone_pos_w=drone_pos_local[post_hit_active],
+                        drone_bottom_z=drone_bottom_z[post_hit_active],
+                        contact=contact[post_hit_active],
+                        has_hit_ball=torch.ones(
+                            int(post_hit_active.sum().item()),
+                            dtype=torch.bool,
+                            device=self.device,
+                        ),
+                        correct_posture=correct_posture[post_hit_active],
+                        drone_net_collision=drone_net_contact[post_hit_active],
+                        episode_length_buf=self.episode_length_buf[post_hit_active],
+                        max_episode_length=self.max_episode_length,
+                        min_height=float(getattr(self.cfg, "serve_hover_min_height", 0.1)),
+                        max_height=float(getattr(self.cfg, "serve_hover_max_height", 4.0)),
+                        return_reason_masks=True,
+                    )
+                    terminated[post_hit_active] = terminated_post
+                    truncated[post_hit_active] = truncated_post
+                    self._serve_hover_termination_rewards[post_hit_active] = extra_term_rewards_post
+                    for key, mask in reason_masks_post.items():
+                        full_mask = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                        full_mask[post_hit_active] = mask
+                        reason_masks[key] = full_mask
+
+                if pre_hit_envs.any():
+                    contact_for_prehit = contact[pre_hit_envs] & (~just_entered_post_hit[pre_hit_envs])
+                    terminated_pre, truncated_pre, reason_masks_pre = compute_dones(
+                        ball_pos_w=ball_pos_local[pre_hit_envs],
+                        racket_pos_w=racket_pos_local[pre_hit_envs],
+                        drone_pos_w=drone_pos_local[pre_hit_envs],
+                        drone_bottom_z=drone_bottom_z[pre_hit_envs],
+                        contact=contact_for_prehit,
+                        net_contact=net_contact[pre_hit_envs],
+                        weak_hit_failure=weak_hit_failure[pre_hit_envs],
+                        drone_up_w=drone_up_w[pre_hit_envs],
+                        episode_length_buf=self.episode_length_buf[pre_hit_envs],
+                        max_episode_length=self.max_episode_length,
+                        safe_bounds=safe_bounds,
+                        z_threshold=0.1,
+                        return_reason_masks=True,
+                    )
+                    truncated_pre = truncated_pre & (~just_entered_post_hit[pre_hit_envs])
+                    pending_pre = pending_weak_hit[pre_hit_envs] & (~weak_hit_failure[pre_hit_envs])
+                    terminated_pre = terminated_pre & (~pending_pre)
+                    truncated_pre = truncated_pre & (~pending_pre)
+                    for key, mask in reason_masks_pre.items():
+                        reason_masks_pre[key] = mask & (~pending_pre)
+                    terminated[pre_hit_envs] = terminated_pre
+                    truncated[pre_hit_envs] = truncated_pre
+                    for key, mask in reason_masks_pre.items():
+                        if key not in reason_masks:
+                            reason_masks[key] = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+                        reason_masks[key][pre_hit_envs] = mask
                 self._last_done_reasons = reason_masks
-                self._serve_hover_termination_rewards = extra_term_rewards
             # 任务二模式：post-hit 阶段使用新的 termination 逻辑
             elif self.enable_post_hit_tracking and self.post_hit is not None and self.post_hit.any():
                 from badminton_intercept.mdp.terminations import compute_dones_task2
@@ -1161,6 +1497,7 @@ class InterceptEnv(DirectRLEnv):
                     terminated_task2, rewards_task2, truncated_task2, reason_masks_task2 = compute_dones_task2(
                         ball_pos_w=ball_pos_local[post_hit_envs],
                         net_contact=net_contact[post_hit_envs],
+                        drone_net_collision=drone_net_contact[post_hit_envs],
                         z_threshold=0.1,
                         max_ball_height=7.0,
                         court_bounds=task2_court_bounds,
@@ -1194,6 +1531,7 @@ class InterceptEnv(DirectRLEnv):
                         drone_bottom_z=drone_bottom_z[non_post_hit],
                         contact=contact_for_dones,
                         net_contact=net_contact[non_post_hit],
+                        weak_hit_failure=weak_hit_failure[non_post_hit],
                         drone_up_w=drone_up_w[non_post_hit],
                         episode_length_buf=self.episode_length_buf[non_post_hit],
                         max_episode_length=self.max_episode_length,
@@ -1203,6 +1541,11 @@ class InterceptEnv(DirectRLEnv):
                     )
                     # 遮蔽 transition 时刻的 timeout，避免 episode 时间到了就打断转入 post-hit
                     truncated_non = truncated_non & ~transitioning_to_post_hit
+                    pending_non = pending_weak_hit[non_post_hit] & (~weak_hit_failure[non_post_hit])
+                    terminated_non = terminated_non & (~pending_non)
+                    truncated_non = truncated_non & (~pending_non)
+                    for key, mask in reason_masks_non.items():
+                        reason_masks_non[key] = mask & (~pending_non)
                     terminated[non_post_hit] = terminated_non
                     truncated[non_post_hit] = truncated_non
 
@@ -1222,6 +1565,7 @@ class InterceptEnv(DirectRLEnv):
                     drone_bottom_z=drone_bottom_z,  # 传递最下面高度用于z边界判定
                     contact=contact,
                     net_contact=net_contact,
+                    weak_hit_failure=weak_hit_failure,
                     drone_up_w=drone_up_w,
                     episode_length_buf=self.episode_length_buf,
                     max_episode_length=self.max_episode_length,
@@ -1229,6 +1573,11 @@ class InterceptEnv(DirectRLEnv):
                     z_threshold=0.1,
                     return_reason_masks=True,
                 )
+                pending_running = pending_weak_hit & (~weak_hit_failure)
+                terminated = terminated & (~pending_running)
+                truncated = truncated & (~pending_running)
+                for key, mask in reason_masks.items():
+                    reason_masks[key] = mask & (~pending_running)
                 self._last_done_reasons = reason_masks
             
             if hasattr(self, "extras"):
@@ -1241,9 +1590,9 @@ class InterceptEnv(DirectRLEnv):
                         # ============================================================
                         # Serve Hover 日志（与 task2 日志完全独立）
                         # reason_masks keys from compute_dones_serve_hover:
-                        #   height_out_of_range, wrong_hit, wrong_hit_pre_contact,
-                        #   wrong_hit_post_contact, hover_phase_reached, timeout,
-                        #   timeout_without_hit
+                        #   height_out_of_range, wrong_hit, wrong_hit_post_contact,
+                        #   hover_phase_reached, timeout, timeout_without_hit,
+                        #   drone_net_collision
                         # ============================================================
                         summary = {}
                         zero_mask = torch.zeros_like(done_mask)
@@ -1259,13 +1608,14 @@ class InterceptEnv(DirectRLEnv):
                         wrong_hit_mask = reason_masks.get("wrong_hit", zero_mask)
                         timeout_mask = reason_masks.get("timeout", zero_mask)
                         drone_net_collision_mask = reason_masks.get("drone_net_collision", zero_mask)
+                        weak_hit_failure_mask = reason_masks.get("weak_hit_failure", zero_mask)
 
                         height_out_count = int((post_hit_done_mask & height_out).sum().item())
                         wrong_hit_count = int((post_hit_done_mask & wrong_hit_mask).sum().item())
                         timeout_count = int((post_hit_done_mask & timeout_mask).sum().item())
                         drone_net_collision_count = int((post_hit_done_mask & drone_net_collision_mask).sum().item())
+                        weak_hit_failure_count = int((done_mask & weak_hit_failure_mask).sum().item())
 
-                        wrong_pre_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_pre_contact", zero_mask)).sum().item())
                         wrong_post_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_post_contact", zero_mask)).sum().item())
 
                         # 分母为 post-hit 阶段结束的 env 数量
@@ -1278,9 +1628,9 @@ class InterceptEnv(DirectRLEnv):
                         summary["serve_hover_wrong_hit_rate"] = float(wrong_hit_count / denom)
                         summary["serve_hover_timeout_rate"] = float(timeout_count / denom)
                         summary["serve_hover_drone_net_collision_rate"] = float(drone_net_collision_count / denom)
+                        summary["pre_hit_weak_hit_failure_rate"] = float(weak_hit_failure_count / float(max(num_resets, 1)))
 
                         # 错误击球细分
-                        summary["serve_hover_wrong_hit_pre_rate"] = float(wrong_pre_count / denom)
                         summary["serve_hover_wrong_hit_post_rate"] = float(wrong_post_count / denom)
 
                         # pre_hit_success_hit_rate（分母为所有结束 episodes）
@@ -1308,6 +1658,7 @@ class InterceptEnv(DirectRLEnv):
                             post_hit_remaining = post_hit_done_mask.clone()
                             post_hit_category_masks = (
                                 ("post_hit_net_contact_rate", reason_masks.get("net_contact", zero_mask)),
+                                ("post_hit_drone_net_collision_rate", reason_masks.get("drone_net_collision", zero_mask)),
                                 ("post_hit_ball_too_high_rate", reason_masks.get("ball_too_high", zero_mask)),
                                 ("post_hit_drone_half_grounded_rate", reason_masks.get("drone_half_grounded", zero_mask)),
                                 ("post_hit_server_half_grounded_rate", reason_masks.get("server_half_grounded", zero_mask)),
@@ -1329,6 +1680,7 @@ class InterceptEnv(DirectRLEnv):
                         # rates live on the same denominator and sum to ~1 together.
                         pre_hit_remaining = pre_hit_done_mask.clone()
                         pre_hit_category_masks = (
+                            ("pre_hit_weak_hit_failure_rate", reason_masks.get("weak_hit_failure", zero_mask)),
                             ("pre_hit_failure_net_contact_rate", reason_masks.get("failure_net_contact", zero_mask)),
                             ("pre_hit_failure_server_side_grounded_rate", reason_masks.get("failure_server_side_grounded", zero_mask)),
                             ("pre_hit_failure_ball_drop_rate", reason_masks.get("failure_ball_drop", zero_mask)),
@@ -1731,6 +2083,16 @@ class InterceptEnv(DirectRLEnv):
                 self._racket_contact_sensor.reset(env_ids)
             if self._net_contact_sensor is not None and hasattr(self._net_contact_sensor, "reset"):
                 self._net_contact_sensor.reset(env_ids)
+            if self._drone_net_contact_sensor is not None and hasattr(self._drone_net_contact_sensor, "reset"):
+                self._drone_net_contact_sensor.reset(env_ids)
+            if self._racket_net_contact_sensor is not None and hasattr(self._racket_net_contact_sensor, "reset"):
+                self._racket_net_contact_sensor.reset(env_ids)
+            if self._net_drone_contact_sensor is not None and hasattr(self._net_drone_contact_sensor, "reset"):
+                self._net_drone_contact_sensor.reset(env_ids)
+
+            # Reset debug counters
+            self._debug_drone_net_count = 0
+            self._debug_drone_net_error_printed = False
 
             self._apply_domain_randomization(env_ids)
             self._reset_drone_state(env_ids)
@@ -1766,6 +2128,20 @@ class InterceptEnv(DirectRLEnv):
             # 重置扫掠接触检测的参考状态
             if self._contact_reference_valid is not None:
                 self._contact_reference_valid[env_ids] = False
+            if self._last_sensor_hit is not None:
+                self._last_sensor_hit[env_ids] = False
+            if self._last_geometric_hit is not None:
+                self._last_geometric_hit[env_ids] = False
+            if self._last_weak_hit_failure is not None:
+                self._last_weak_hit_failure[env_ids] = False
+            if self._pending_weak_hit is not None:
+                self._pending_weak_hit[env_ids] = False
+            if self._pending_weak_hit_age is not None:
+                self._pending_weak_hit_age[env_ids] = 0
+            if self._weak_hit_termination_rewards is not None:
+                self._weak_hit_termination_rewards[env_ids] = 0.0
+            if self._serve_hover_termination_rewards is not None:
+                self._serve_hover_termination_rewards[env_ids] = 0.0
             if self.post_hit is not None:
                 self.post_hit[env_ids] = False
             if self._just_entered_post_hit is not None:

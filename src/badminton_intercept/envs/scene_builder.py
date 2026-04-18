@@ -104,6 +104,7 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
         prim_path="/World/envs/env_.*/ShuttlecockProxy",
         spawn=sim_utils.SphereCfg(
             radius=float(getattr(cfg, "shuttle_radius_m", 0.03)),
+            activate_contact_sensors=True,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0)),
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
@@ -136,6 +137,7 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
         prim_path="/World/envs/env_.*/Net",
         spawn=sim_utils.CuboidCfg(
             size=(net_thickness, net_width, net_height),
+            activate_contact_sensors=True,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.4, 0.9)),
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",

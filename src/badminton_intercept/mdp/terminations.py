@@ -9,6 +9,7 @@ except Exception:
 def compute_dones_task2(
     ball_pos_w=None,
     net_contact=None,
+    drone_net_collision=None,
     z_threshold: float = 0.1,
     max_ball_height: float = 7.0,
     court_bounds: dict | None = None,
@@ -21,11 +22,12 @@ def compute_dones_task2(
     This function handles ONLY the post-hit phase. It assumes all environments
     have already transitioned past the hit moment.
 
-    Termination conditions (ball-only, no drone/timeout):
+    Termination conditions (post-hit, no timeout):
     1. Ball touches the net
     2. Ball touches the ground (drone half x>0 or server half x<0)
     3. Ball goes out of bounds (both halves)
     4. Ball height exceeds 7m
+    5. Drone/racket touches the net
 
     NOTE: There is NO episode timeout for post-hit. The episode runs until the
     ball actually lands/goes out, regardless of simulated time elapsed.
@@ -38,6 +40,7 @@ def compute_dones_task2(
     Args:
         ball_pos_w: Ball position in local court frame, shape (N, 3)
         net_contact: Boolean tensor for net contact, shape (N,)
+        drone_net_collision: Boolean tensor for drone/racket-net contact, shape (N,)
         z_threshold: Ground threshold for ball grounded detection
         max_ball_height: Maximum allowed ball height (default 7.0m)
         court_bounds: Dict with 'x' and 'y' bounds, e.g., {'x': (-6.7, 6.7), 'y': (-3.05, 3.05)}
@@ -66,6 +69,8 @@ def compute_dones_task2(
 
     if net_contact is None:
         net_contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    if drone_net_collision is None:
+        drone_net_collision = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     if court_bounds is None:
         court_bounds = {
@@ -84,6 +89,7 @@ def compute_dones_task2(
     in_server_half = ~in_drone_half
 
     net_contact_flag = net_contact
+    drone_net_collision_flag = drone_net_collision
 
     ball_grounded = ball_z <= z_threshold
     drone_half_grounded = in_drone_half & ball_grounded
@@ -104,6 +110,7 @@ def compute_dones_task2(
         | drone_half_out
         | server_half_out
         | ball_too_high
+        | drone_net_collision_flag
     )
 
     rewards = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -123,6 +130,7 @@ def compute_dones_task2(
         "drone_half_out": drone_half_out,
         "server_half_out": server_half_out,
         "ball_too_high": ball_too_high,
+        "drone_net_collision": drone_net_collision_flag,
         "reward_server_half_grounded": server_half_grounded,
         "reward_server_half_out": server_half_out & (~server_half_grounded),
     }
@@ -175,11 +183,11 @@ def compute_dones_serve_hover(
     high_height = drone_pos_w[:, 2] > max_height
     height_out_of_range = low_height | high_height
 
-    pre_hit_invalid_contact = contact & (~has_hit_ball) & (~correct_posture)
     post_hit_contact = contact & has_hit_ball
-    wrong_hit = pre_hit_invalid_contact | post_hit_contact
+    wrong_hit = post_hit_contact
 
-    # drone-net collision: only counts after ball is hit
+    # Drone/racket-net collision only terminates after a successful hit has entered
+    # the hover phase. The env masks out the first hit-transition frame before calling.
     net_collision = drone_net_collision & has_hit_ball
 
     terminated = height_out_of_range | wrong_hit | net_collision
@@ -197,7 +205,6 @@ def compute_dones_serve_hover(
     reason_masks = {
         "height_out_of_range": height_out_of_range,
         "wrong_hit": wrong_hit,
-        "wrong_hit_pre_contact": pre_hit_invalid_contact,
         "wrong_hit_post_contact": post_hit_contact,
         "hover_phase_reached": has_hit_ball,
         "timeout": truncated,
@@ -222,6 +229,7 @@ def compute_dones(
     drone_pos_w=None,
     contact=None,
     net_contact=None,
+    weak_hit_failure=None,
     drone_up_w=None,
     drone_bottom_z=None,
     episode_length_buf=None,
@@ -243,7 +251,9 @@ def compute_dones(
     success = contact
     if net_contact is None:
         net_contact = torch.zeros_like(success)
-    failure_net = (~success) & net_contact
+    if weak_hit_failure is None:
+        weak_hit_failure = torch.zeros_like(success)
+    failure_net = (~success) & (~weak_hit_failure) & net_contact
 
     ball_z = ball_pos_w[:, 2]
     racket_z = racket_pos_w[:, 2]
@@ -252,8 +262,15 @@ def compute_dones(
     in_drone_half = ball_pos_w[:, 0] > 0.0  # 球在无人机半场
     ball_below_racket = ball_z < racket_z_threshold
     ball_grounded = ball_z <= z_threshold
-    failure_server_side_grounded = (~success) & (~failure_net) & (~in_drone_half) & ball_grounded
-    failure_ball = (~success) & (~failure_net) & (~failure_server_side_grounded) & in_drone_half & ball_below_racket
+    failure_server_side_grounded = (~success) & (~weak_hit_failure) & (~failure_net) & (~in_drone_half) & ball_grounded
+    failure_ball = (
+        (~success)
+        & (~weak_hit_failure)
+        & (~failure_net)
+        & (~failure_server_side_grounded)
+        & in_drone_half
+        & ball_below_racket
+    )
 
     if safe_bounds is None:
         failure_bounds = torch.zeros_like(failure_ball)
@@ -271,7 +288,14 @@ def compute_dones(
             | (z_to_check < z_min)
             | (z_to_check > z_max)
         )
-        failure_bounds = (~success) & (~failure_net) & (~failure_server_side_grounded) & (~failure_ball) & failure_bounds
+        failure_bounds = (
+            (~success)
+            & (~weak_hit_failure)
+            & (~failure_net)
+            & (~failure_server_side_grounded)
+            & (~failure_ball)
+            & failure_bounds
+        )
 
     if drone_up_w is None:
         failure_tilt = torch.zeros_like(failure_ball)
@@ -279,6 +303,7 @@ def compute_dones(
         # z-axis facing down means unstable/flip-like posture
         failure_tilt = (
             (~success)
+            & (~weak_hit_failure)
             & (~failure_net)
             & (~failure_server_side_grounded)
             & (~failure_ball)
@@ -286,7 +311,15 @@ def compute_dones(
             & (drone_up_w[:, 2] < 0.0)
         )
 
-    terminated = success | failure_net | failure_server_side_grounded | failure_ball | failure_bounds | failure_tilt
+    terminated = (
+        success
+        | weak_hit_failure
+        | failure_net
+        | failure_server_side_grounded
+        | failure_ball
+        | failure_bounds
+        | failure_tilt
+    )
 
     if episode_length_buf is None or max_episode_length is None:
         truncated = torch.zeros_like(terminated)
@@ -298,6 +331,7 @@ def compute_dones(
 
     reason_masks = {
         "success_contact": success,
+        "weak_hit_failure": weak_hit_failure,
         "failure_net_contact": failure_net,
         "failure_server_side_grounded": failure_server_side_grounded,
         "failure_ball_drop": failure_ball,

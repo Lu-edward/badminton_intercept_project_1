@@ -40,31 +40,62 @@ if ISAACLAB_CFG_AVAILABLE:
 
         # scene
         scene: InteractiveSceneCfg = InteractiveSceneCfg(
-            num_envs=4096, env_spacing=4.0, replicate_physics=True, clone_in_fabric=True
+            num_envs=4096, env_spacing=4.0, replicate_physics=True, clone_in_fabric=False
         )
         
         # Contact sensor for racket-shuttlecock collision detection
         contact_sensor: ContactSensorCfg = ContactSensorCfg(
-            # Support both /Drone/bat and /Drone/TransferAsset/bat layouts.
-            prim_path="/World/envs/env_.*/Drone.*/[Bb]at",
-            filter_prim_paths_expr=["/World/envs/env_.*/ShuttlecockProxy"],
+            # Attach to the shuttlecock and filter the bat so this detects
+            # racket-ball contact, not body-ball contact.
+            prim_path="/World/envs/env_.*/ShuttlecockProxy",
+            filter_prim_paths_expr=["/World/envs/env_.*/Drone.*/[Bb]at"],
             history_length=3,
             update_period=0.0,
             track_air_time=False,
-            force_threshold=0.1,
+            force_threshold=1.0,
         )
         net_contact_sensor: ContactSensorCfg = ContactSensorCfg(
-            prim_path="/World/envs/env_.*/ShuttlecockProxy",
-            filter_prim_paths_expr=["/World/envs/env_.*/Net"],
+            prim_path="/World/envs/env_.*/Net",
+            filter_prim_paths_expr=["/World/envs/env_.*/ShuttlecockProxy"],
             history_length=3,
             update_period=0.0,
             track_air_time=False,
             force_threshold=0.05,
         )
+        drone_net_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+            # Support both /Drone/base_link and /Drone/TransferAsset/base_link layouts.
+            prim_path="/World/envs/env_.*/Drone.*/base_link",
+            filter_prim_paths_expr=["/World/envs/env_.*/Net"],
+            history_length=3,
+            update_period=0.0,
+            track_air_time=False,
+            force_threshold=15.0,
+        )
+        racket_net_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+            # Not registered by InterceptEnv by default: some bat prims are
+            # collision children without contact reporter API. Net-side sensing
+            # covers racket-net contact via net_drone_contact_sensor.
+            prim_path="/World/envs/env_.*/Drone.*/[Bb]at",
+            filter_prim_paths_expr=["/World/envs/env_.*/Net"],
+            history_length=3,
+            update_period=0.0,
+            track_air_time=False,
+            force_threshold=15.0,
+        )
+        net_drone_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Net",
+            filter_prim_paths_expr=[
+                "/World/envs/env_.*/Drone.*/base_link",
+            ],
+            history_length=3,
+            update_period=0.0,
+            track_air_time=False,
+            force_threshold=15.0,
+        )
 
         # sim
         sim: SimulationCfg = SimulationCfg(
-            dt=1 / 200,
+            dt=1 / 400,
             render_interval=decimation,
               physx=PhysxCfg(
                 enable_ccd=True,
@@ -111,21 +142,25 @@ if ISAACLAB_CFG_AVAILABLE:
         rate_d_scale: float = 0.15
         rate_i_scale: float = 0.05
         rate_integral_limit: float = 3.0
-        shuttle_radius_m: float = 0.015
+        shuttle_radius_m: float = 0.025
         shuttle_mass_kg: float = 0.005
         shuttle_init_pos: tuple[float, float, float] = (-2.0, 0.0, 1.6)
         racket_offset_z_m: float = 0.2
         contact_radius_m: float = 0.09
         racket_body_name_expr: str = ".*[Bb]at.*"
-        contact_force_threshold: float = 0.1
+        contact_force_threshold: float = 1.0
         hit_normal_velocity_delta_threshold_mps: float = 1.0
         net_thickness_m: float = 0.03
         net_contact_force_threshold: float = 0.05
+        drone_net_contact_force_threshold: float = 15.0
+        drone_net_contact_debug_print: bool = False
+        weak_hit_reward: float = 5
+        weak_hit_sensor_grace_steps: int = 2
         net_width_m: float = 6.5
         ground_restitution: float = 0.1
         nominal_drag_length_m: float = 4.1
         policy_hz: int = 50
-        physics_hz: int = 200
+        physics_hz: int = 400
         curriculum_window_episodes: int = 100
         curriculum_promote_success_rate: float = 0.85
         curriculum_promote_iteration_streak: int = 10
@@ -203,21 +238,25 @@ else:
         rate_d_scale: float = 0.15
         rate_i_scale: float = 0.05
         rate_integral_limit: float = 3.0
-        shuttle_radius_m: float = 0.015
+        shuttle_radius_m: float = 0.025
         shuttle_mass_kg: float = 0.005
         shuttle_init_pos: tuple[float, float, float] = (-2.0, 0.0, 1.6)
         racket_offset_z_m: float = 0.2
         contact_radius_m: float = 0.09
         racket_body_name_expr: str = ".*[Bb]at.*"
-        contact_force_threshold: float = 0.1
+        contact_force_threshold: float = 1.0
         hit_normal_velocity_delta_threshold_mps: float = 1.0
         net_thickness_m: float = 0.03
         net_contact_force_threshold: float = 0.05
+        drone_net_contact_force_threshold: float = 15.0
+        drone_net_contact_debug_print: bool = False
+        weak_hit_reward: float = 5
+        weak_hit_sensor_grace_steps: int = 2
         net_width_m: float = 6.5
         ground_restitution: float = 0.1
         nominal_drag_length_m: float = 4.1
         policy_hz: int = 50
-        physics_hz: int = 200
+        physics_hz: int = 400
         curriculum_window_episodes: int = 100
         curriculum_promote_success_rate: float = 0.85
         curriculum_promote_iteration_streak: int = 10
