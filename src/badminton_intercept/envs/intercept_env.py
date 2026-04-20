@@ -1420,11 +1420,12 @@ class InterceptEnv(DirectRLEnv):
 
                 # Debug: log drone_net_contact and has_hit_ball status
                 drone_net_contact_for_hover = drone_net_contact & post_hit_active
-                if hasattr(self, '_debug_drone_net_count') and int(drone_net_contact_for_hover.sum()) > 0:
-                    print(
-                        "[DEBUG] drone_net_contact detected: "
-                        f"{int(drone_net_contact_for_hover.sum())}, post_hit_active={int(post_hit_active.sum())}"
-                    )
+                if bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
+                    if int(drone_net_contact_for_hover.sum()) > 0:
+                        print(
+                            "[DEBUG] drone_net_contact detected: "
+                            f"{int(drone_net_contact_for_hover.sum())}, post_hit_active={int(post_hit_active.sum())}"
+                        )
 
                 if post_hit_active.any():
                     terminated_post, truncated_post, reason_masks_post, extra_term_rewards_post = compute_dones_serve_hover(

@@ -8,3 +8,4 @@ scripts/*
 
 scripts/__pycache__/
 scripts/test/
+logs/
