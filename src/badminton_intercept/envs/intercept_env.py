@@ -73,8 +73,8 @@ class InterceptEnv(DirectRLEnv):
         self.enable_serve_hover = bool(getattr(cfg, "enable_serve_hover", False))
         if self.enable_serve_hover:
             cfg.enable_post_hit_tracking = True
-            cfg.observation_space = 21
-            cfg.state_space = 21
+            cfg.observation_space = 23
+            cfg.state_space = 23
 
         self._scene_cfgs: SceneEntityConfigs | None = None
         self._drone = None
@@ -151,6 +151,10 @@ class InterceptEnv(DirectRLEnv):
         self._hit_ball_vel_w = None
         self._hit_time_elapsed = None
         self._post_hit_trajectory_updated = False  # Guard to update once per step
+        self._task2_server_ground_hold_active = None
+        self._task2_server_ground_landing_pos_local = None
+        self._task2_server_ground_hold_elapsed_s = None
+        self._task2_server_ground_hold_updated = False
         self._launch_sampler_mode = get_launch_sampler_mode(cfg)
         self._launch_libraries: dict[int, dict[str, Any]] | None = None
         self._curriculum = CurriculumManager(
@@ -517,6 +521,9 @@ class InterceptEnv(DirectRLEnv):
         self._hit_ball_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._hit_ball_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
         self._hit_time_elapsed = torch.zeros((self.num_envs,), device=self.device)
+        self._task2_server_ground_hold_active = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self._task2_server_ground_landing_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
+        self._task2_server_ground_hold_elapsed_s = torch.zeros((self.num_envs,), device=self.device)
         self._resolve_force_body_ids()
         self._resolve_racket_body_ids()
 
@@ -856,6 +863,12 @@ class InterceptEnv(DirectRLEnv):
 
                 # 重置轨迹计时器
                 self._hit_time_elapsed[newly_hit] = 0.0
+                if self._task2_server_ground_hold_active is not None:
+                    self._task2_server_ground_hold_active[newly_hit] = False
+                if self._task2_server_ground_landing_pos_local is not None:
+                    self._task2_server_ground_landing_pos_local[newly_hit] = 0.0
+                if self._task2_server_ground_hold_elapsed_s is not None:
+                    self._task2_server_ground_hold_elapsed_s[newly_hit] = 0.0
 
         return contact, d_axis
 
@@ -1011,6 +1024,7 @@ class InterceptEnv(DirectRLEnv):
         self.last_actions = actions
         # Reset trajectory update guard at start of each step
         self._post_hit_trajectory_updated = False
+        self._task2_server_ground_hold_updated = False
         if self._just_entered_post_hit is not None:
             self._just_entered_post_hit.zero_()
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
@@ -1190,6 +1204,72 @@ class InterceptEnv(DirectRLEnv):
 
         self._post_hit_trajectory_updated = True
 
+    def _get_step_dt_s(self) -> float:
+        sim_cfg = getattr(self.cfg, "sim", None)
+        if sim_cfg is not None and hasattr(sim_cfg, "dt"):
+            return float(sim_cfg.dt)
+        return float(getattr(self.cfg, "sim_dt", 0.005))
+
+    def _is_task2_server_ground_hold_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "enable_task2_server_ground_hold", False))
+
+    def _get_task2_server_ground_hold_duration_s(self) -> float:
+        return float(getattr(self.cfg, "task2_server_ground_hold_duration_s", 3.0))
+
+    def _update_task2_server_ground_hold_state(self, ball_pos_local, z_threshold: float = 0.1):
+        if (
+            ball_pos_local is None
+            or not self.enable_post_hit_tracking
+            or not self._is_task2_server_ground_hold_enabled()
+            or self.enable_serve_hover
+            or self.post_hit is None
+            or self._task2_server_ground_hold_active is None
+            or self._task2_server_ground_landing_pos_local is None
+            or self._task2_server_ground_hold_elapsed_s is None
+        ):
+            return
+
+        in_server_half = ball_pos_local[:, 0] <= 0.0
+        server_grounded_now = self.post_hit & in_server_half & (ball_pos_local[:, 2] <= z_threshold)
+        newly_grounded = server_grounded_now & (~self._task2_server_ground_hold_active)
+
+        if newly_grounded.any():
+            landing_pos_local = ball_pos_local[newly_grounded].clone()
+            landing_pos_local[:, 2] = 0.0
+            self._task2_server_ground_landing_pos_local[newly_grounded] = landing_pos_local
+            self._task2_server_ground_hold_elapsed_s[newly_grounded] = 0.0
+            self._task2_server_ground_hold_active[newly_grounded] = True
+
+        active_before_step = self._task2_server_ground_hold_active & (~newly_grounded)
+        if (not self._task2_server_ground_hold_updated) and bool(torch.any(active_before_step)):
+            self._task2_server_ground_hold_elapsed_s[active_before_step] += self._get_step_dt_s()
+        self._task2_server_ground_hold_updated = True
+
+    def _get_task2_ball_state_for_policy(self, ball_pos_local, ball_lin_vel_w=None):
+        if (
+            ball_pos_local is None
+            or not self.enable_post_hit_tracking
+            or not self._is_task2_server_ground_hold_enabled()
+            or self.enable_serve_hover
+            or self._task2_server_ground_hold_active is None
+        ):
+            return ball_pos_local, ball_lin_vel_w
+
+        self._update_task2_server_ground_hold_state(ball_pos_local, z_threshold=0.1)
+        hold_active = self._task2_server_ground_hold_active
+        if not bool(torch.any(hold_active)):
+            return ball_pos_local, ball_lin_vel_w
+
+        effective_ball_pos_local = ball_pos_local.clone()
+        effective_ball_pos_local[hold_active] = self._task2_server_ground_landing_pos_local[hold_active]
+
+        if ball_lin_vel_w is None:
+            return effective_ball_pos_local, None
+
+        effective_ball_lin_vel_w = ball_lin_vel_w.clone()
+        effective_ball_lin_vel_w[hold_active] = 0.0
+        return effective_ball_pos_local, effective_ball_lin_vel_w
+
 
     def _get_observations(self):
         if ISAACLAB_RUNTIME_AVAILABLE and torch is not None:
@@ -1207,6 +1287,10 @@ class InterceptEnv(DirectRLEnv):
             if hasattr(self.scene, "env_origins"):
                 drone_pos_local = drone_pos_w - self.scene.env_origins
                 ball_pos_local = ball_pos_w - self.scene.env_origins
+            task2_ball_pos_local, task2_ball_lin_vel_w = self._get_task2_ball_state_for_policy(
+                ball_pos_local,
+                ball_lin_vel_w,
+            )
             hit_point_w = self._launch_hit_point_local + self.scene.env_origins
             hit_point_rel_w = hit_point_w - drone_pos_w
 
@@ -1235,6 +1319,7 @@ class InterceptEnv(DirectRLEnv):
                     hit_point_rel=hit_point_rel_w,
                     hover_target_pos=hover_target,
                     post_hit_mask=post_hit_mask,
+                    prev_action=self._prev_actions,
                     privileged=privileged,
                     add_actor_noise=True,
                     noise_std=0.01,
@@ -1245,8 +1330,8 @@ class InterceptEnv(DirectRLEnv):
                     drone_quat_w=drone_quat_w,
                     drone_lin_vel=drone_lin_vel_w,
                     drone_ang_vel=drone_ang_vel_w,
-                    ball_pos=ball_pos_local,
-                    ball_lin_vel=ball_lin_vel_w,
+                    ball_pos=task2_ball_pos_local,
+                    ball_lin_vel=task2_ball_lin_vel_w,
                     hit_time_s=self._launch_hit_time_s,
                     hit_point_rel=hit_point_rel_w,
                     privileged=privileged,
@@ -1288,16 +1373,22 @@ class InterceptEnv(DirectRLEnv):
                 drone_pos_local = drone_pos_w - self.scene.env_origins
                 racket_pos_local = racket_pos_w - self.scene.env_origins
                 ball_pos_local = ball_pos_w - self.scene.env_origins
+            task2_ball_pos_local, task2_ball_lin_vel_w = self._get_task2_ball_state_for_policy(
+                ball_pos_local,
+                ball_lin_vel_w,
+            )
 
             if self.enable_serve_hover:
-                hover_target = self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype)
+                from badminton_intercept.mdp.rewards import compute_rewards_serve_hover
                 rewards = compute_rewards_serve_hover(
                     drone_pos=drone_pos_local,
                     drone_up_w=drone_up_w,
                     drone_ang_vel_w=drone_ang_vel_w,
                     drone_quat_w=drone_quat_w,
+                    drone_lin_vel_w=drone_lin_vel_w,
+                    ball_pos_w=task2_ball_pos_local,
                     has_hit_ball=self.post_hit,
-                    hover_target_pos=hover_target,
+                    hover_target_pos=self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype),
                 )
                 total_reward = rewards["total"]
                 if self._serve_hover_termination_rewards is not None:
@@ -1313,8 +1404,8 @@ class InterceptEnv(DirectRLEnv):
 
                 rewards = compute_rewards_task2(
                     racket_pos_w=racket_pos_local,
-                    ball_pos_w=ball_pos_local,
-                    ball_vel_w=ball_lin_vel_w,
+                    ball_pos_w=task2_ball_pos_local,
+                    ball_vel_w=task2_ball_lin_vel_w,
                     contact=contact,
                     action=self._actions,
                     prev_action=self._prev_actions,
@@ -1330,7 +1421,6 @@ class InterceptEnv(DirectRLEnv):
                     max_episode_length=self.max_episode_length,
                     has_hit_ball=self.post_hit,
                     c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
-                    c_vert_vel=float(getattr(self.cfg, "reward_c_vert_vel", 0.1)),
                 )
                 total_reward = rewards["total"]
                 if self._weak_hit_termination_rewards is not None:
@@ -1354,7 +1444,6 @@ class InterceptEnv(DirectRLEnv):
                 episode_length_buf=self.episode_length_buf,
                 max_episode_length=self.max_episode_length,
                 c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
-                c_vert_vel=float(getattr(self.cfg, "reward_c_vert_vel", 0.1)),
             )
             return rewards["total"]
         return compute_rewards()
@@ -1402,6 +1491,7 @@ class InterceptEnv(DirectRLEnv):
                 drone_pos_local = drone_pos_w - self.scene.env_origins
                 racket_pos_local = racket_pos_w - self.scene.env_origins
                 ball_pos_local = ball_pos_w - self.scene.env_origins
+            task2_ball_pos_local, _ = self._get_task2_ball_state_for_policy(ball_pos_local, None)
             # 使用无人机的最下面点来判断（中心高度 - 0.13m）
             drone_bottom_z = drone_pos_local[:, 2] - 0.13
             safe_bounds = {"x": (0.0, 6.7), "y": (-3.05, 3.05), "z": (0.2, 3.0)}  # 最下面不低于20cm
@@ -1496,7 +1586,7 @@ class InterceptEnv(DirectRLEnv):
                 if post_hit_envs.any():
                     task2_court_bounds = {"x": (-6.7, 6.7), "y": (-3.05, 3.05)}
                     terminated_task2, rewards_task2, truncated_task2, reason_masks_task2 = compute_dones_task2(
-                        ball_pos_w=ball_pos_local[post_hit_envs],
+                        ball_pos_w=task2_ball_pos_local[post_hit_envs],
                         net_contact=net_contact[post_hit_envs],
                         drone_net_collision=drone_net_contact[post_hit_envs],
                         z_threshold=0.1,
@@ -1504,6 +1594,30 @@ class InterceptEnv(DirectRLEnv):
                         court_bounds=task2_court_bounds,
                         return_reason_masks=True,
                     )
+                    hold_active = (
+                        self._task2_server_ground_hold_active[post_hit_envs]
+                        if self._task2_server_ground_hold_active is not None
+                        else torch.zeros_like(terminated_task2)
+                    )
+                    hold_expired = (
+                        hold_active
+                        & (
+                            self._task2_server_ground_hold_elapsed_s[post_hit_envs]
+                            >= self._get_task2_server_ground_hold_duration_s()
+                        )
+                    )
+                    other_termination = (
+                        reason_masks_task2["net_contact"]
+                        | reason_masks_task2["drone_half_grounded"]
+                        | reason_masks_task2["drone_half_out"]
+                        | reason_masks_task2["server_half_out"]
+                        | reason_masks_task2["ball_too_high"]
+                        | reason_masks_task2["drone_net_collision"]
+                    )
+                    terminated_task2 = other_termination | hold_expired
+                    truncated_task2 = truncated_task2 & (~hold_active)
+                    reason_masks_task2["server_half_ground_hold_active"] = hold_active
+                    reason_masks_task2["server_half_ground_hold_complete"] = hold_expired
                     terminated[post_hit_envs] = terminated_task2
                     truncated[post_hit_envs] = truncated_task2
 
@@ -2163,6 +2277,12 @@ class InterceptEnv(DirectRLEnv):
                 self._hit_ball_vel_w[env_ids] = 0.0
             if self._hit_time_elapsed is not None:
                 self._hit_time_elapsed[env_ids] = 0.0
+            if self._task2_server_ground_hold_active is not None:
+                self._task2_server_ground_hold_active[env_ids] = False
+            if self._task2_server_ground_landing_pos_local is not None:
+                self._task2_server_ground_landing_pos_local[env_ids] = 0.0
+            if self._task2_server_ground_hold_elapsed_s is not None:
+                self._task2_server_ground_hold_elapsed_s[env_ids] = 0.0
             return
 
         return reset_subenvs(env_ids)

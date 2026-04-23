@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from typing import Literal
 
 # === 统一修改点：无人机最大推力 (N) ===
@@ -137,7 +137,6 @@ if ISAACLAB_CFG_AVAILABLE:
         termination_debug_print: bool = False
         reward_c_tilt: float = 2.0
         reward_c_ang_vel: float = 0.05
-        reward_c_vert_vel: float = 0.1
         rate_p_scale: float = 1.0
         rate_d_scale: float = 0.15
         rate_i_scale: float = 0.05
@@ -198,6 +197,8 @@ if ISAACLAB_CFG_AVAILABLE:
         arena: ArenaCfg = field(default_factory=ArenaCfg)
         enable_post_hit_tracking: bool = False
         enable_serve_hover: bool = False
+        enable_task2_server_ground_hold: bool = False
+        task2_server_ground_hold_duration_s: float = 3.0
         post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
         serve_hover_min_height: float = 0.1
         serve_hover_max_height: float = 4.0
@@ -233,7 +234,6 @@ else:
         termination_debug_print: bool = False
         reward_c_tilt: float = 2.0
         reward_c_ang_vel: float = 0.05
-        reward_c_vert_vel: float = 0.1
         rate_p_scale: float = 1.0
         rate_d_scale: float = 0.15
         rate_i_scale: float = 0.05
@@ -293,6 +293,8 @@ else:
         randomization_enabled: bool = True
         enable_post_hit_tracking: bool = False
         enable_serve_hover: bool = False
+        enable_task2_server_ground_hold: bool = False
+        task2_server_ground_hold_duration_s: float = 3.0
         post_hit_trajectory_mode: str = "physx"  # "physx" or "analytical"
         serve_hover_min_height: float = 0.1
         serve_hover_max_height: float = 4.0

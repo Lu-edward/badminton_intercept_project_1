@@ -115,6 +115,7 @@ def build_serve_hover_observations(
     hit_point_rel=None,
     hover_target_pos=None,
     post_hit_mask=None,
+    prev_action=None,
     privileged: dict | None = None,
     add_actor_noise: bool = False,
     noise_std: float = 0.01,
@@ -124,24 +125,21 @@ def build_serve_hover_observations(
     Returned groups:
     - task2_policy: frozen task2 actor input
     - task2_critic_obs: frozen task2 critic input
-    - policy: hover actor input = drone_state + up + heading + rheading + hover_rpos
+    - policy: hover actor input = drone_pos + rotmat + lin_vel + ang_vel + prev_action
     - critic: hover critic input
     - post_hit_mask: phase selector used by the dual policy / PPO mask
 
-    Policy obs structure (30 dims):
+    Policy obs structure (23 dims):
         0-2:   drone_pos (3)
         3-11:  rotmat (9)
         12-14: drone_lin_vel (3)
         15-17: drone_ang_vel (3)
-        18-20: up (3) — drone's up direction in world frame
-        21-23: heading (3) — drone's forward direction in world frame
-        24-26: Server_hover_rheading (3) — target heading [-1,0,0] - heading
-        27-29: hover_rpos (3) — hover_target - drone_pos
+        18-21: prev_action (4)
     """
     if torch is None or drone_pos is None:
         zeros_task2_policy = [0.0] * 31
         zeros_task2_critic = [0.0] * 34
-        zeros_hover = [0.0] * 30
+        zeros_hover = [0.0] * 23
         return {
             "task2_policy": zeros_task2_policy,
             "task2_critic_obs": zeros_task2_critic,
@@ -165,22 +163,12 @@ def build_serve_hover_observations(
     )
 
     rotmat = _quat_to_rotmat_wxyz(drone_quat_w).reshape(drone_pos.shape[0], 9)
-    if hover_target_pos is None:
-        hover_target_pos = torch.zeros_like(drone_pos)
     if post_hit_mask is None:
         post_hit_mask = torch.zeros((drone_pos.shape[0], 1), dtype=drone_pos.dtype, device=drone_pos.device)
     elif post_hit_mask.dim() == 1:
         post_hit_mask = post_hit_mask.unsqueeze(-1)
-
-    # up = rotmat @ [0, 0, 1] = third column of rotmat = [r02, r12, r22]
-    up = torch.stack([rotmat[:, 2], rotmat[:, 5], rotmat[:, 8]], dim=-1)
-    # heading = rotmat @ [1, 0, 0] = first column of rotmat
-    heading = torch.stack([rotmat[:, 0], rotmat[:, 3], rotmat[:, 6]], dim=-1)
-    # rheading = target_heading - heading, target = [-1, 0, 0] (toward server side)
-    target_heading = torch.tensor([-1.0, 0.0, 0.0], dtype=drone_pos.dtype, device=drone_pos.device)
-    rheading = target_heading - heading
-    # hover_rpos
-    hover_rpos = hover_target_pos - drone_pos
+    if prev_action is None:
+        prev_action = torch.zeros((drone_pos.shape[0], 4), dtype=drone_pos.dtype, device=drone_pos.device)
 
     hover_actor = torch.cat(
         [
@@ -188,10 +176,7 @@ def build_serve_hover_observations(
             rotmat,         # 9
             drone_lin_vel,  # 3
             drone_ang_vel,  # 3
-            up,             # 3
-            heading,        # 3
-            rheading,       # 3
-            hover_rpos,     # 3
+            prev_action,    # 4
         ],
         dim=-1,
     )
