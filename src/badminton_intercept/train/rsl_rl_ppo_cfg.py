@@ -11,6 +11,8 @@ class BadmintonInterceptPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "badminton_intercept_direct"
     enable_serve_hover = False
     prehit_checkpoint_path = ""
+    serve_hover_actor_freeze_iterations = 0
+    serve_hover_actor_lr_scale = 1.0
     obs_groups = {
         "policy": ["policy"],
         "critic": ["critic"],

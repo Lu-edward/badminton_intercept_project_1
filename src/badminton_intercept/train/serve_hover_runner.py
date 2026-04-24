@@ -410,6 +410,15 @@ class ServeHoverDualActorCritic(nn.Module):
 
     @property
     def action_std(self) -> torch.Tensor:
+        # rsl_rl logs policy.action_std directly. In serve-hover mode we care about
+        # the trainable hover branch std, while task2 is frozen and filtered out.
+        hover_distribution = getattr(self.hover_actor_critic, "distribution", None)
+        if hover_distribution is not None:
+            return hover_distribution.stddev
+        if hasattr(self.hover_actor_critic, "log_std"):
+            return torch.exp(self.hover_actor_critic.log_std)
+        if hasattr(self.hover_actor_critic, "std"):
+            return self.hover_actor_critic.std
         return self.distribution.stddev
 
     @property
@@ -482,8 +491,10 @@ class ServeHoverDualActorCritic(nn.Module):
     def reset(self, dones: torch.Tensor | None = None) -> None:
         return None
 
-    def _post_hit_mask(self, obs: TensorDict) -> torch.Tensor:
-        mask = obs["post_hit_mask"]
+    @staticmethod
+    def _resolve_serve_hover_mask(obs: TensorDict) -> torch.Tensor:
+        mask_key = "serve_hover_mask" if "serve_hover_mask" in obs.keys() else "post_hit_mask"
+        mask = obs[mask_key]
         if mask.dim() > 1:
             mask = mask.squeeze(-1)
         return mask >= 0.5
@@ -493,7 +504,7 @@ class ServeHoverDualActorCritic(nn.Module):
         return actor_critic.distribution
 
     def _build_combined_distribution(self, obs: TensorDict) -> Normal:
-        post_hit_mask = self._post_hit_mask(obs).unsqueeze(-1)
+        post_hit_mask = self._resolve_serve_hover_mask(obs).unsqueeze(-1)
 
         task2_actor_obs = self.task2_actor_critic.actor_obs_normalizer(self.task2_actor_critic.get_actor_obs(obs))
         hover_actor_obs = self.hover_actor_critic.actor_obs_normalizer(self.hover_actor_critic.get_actor_obs(obs))
@@ -511,13 +522,13 @@ class ServeHoverDualActorCritic(nn.Module):
         return distribution.sample()
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
-        post_hit_mask = self._post_hit_mask(obs).unsqueeze(-1)
+        post_hit_mask = self._resolve_serve_hover_mask(obs).unsqueeze(-1)
         task2_actions = self.task2_actor_critic.act_inference(obs)
         hover_actions = self.hover_actor_critic.act_inference(obs)
         return torch.where(post_hit_mask, hover_actions, task2_actions)
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        post_hit_mask = self._post_hit_mask(obs).unsqueeze(-1)
+        post_hit_mask = self._resolve_serve_hover_mask(obs).unsqueeze(-1)
         task2_values = self.task2_actor_critic.evaluate(obs)
         hover_values = self.hover_actor_critic.evaluate(obs)
         return torch.where(post_hit_mask, hover_values, task2_values)
@@ -526,7 +537,7 @@ class ServeHoverDualActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def update_normalization(self, obs: TensorDict) -> None:
-        post_hit_mask = self._post_hit_mask(obs)
+        post_hit_mask = self._resolve_serve_hover_mask(obs)
         if not bool(torch.any(post_hit_mask)):
             return
         masked_obs = TensorDict(
@@ -657,6 +668,12 @@ class ServeHoverMaskedPPO(PPO):
     
     def __init__(self, policy: ServeHoverDualActorCritic, *args, **kwargs) -> None:
         storage = kwargs.pop("storage", None)
+        self.actor_freeze_iterations = int(kwargs.pop("actor_freeze_iterations", 0) or 0)
+        self.actor_lr_scale = float(kwargs.pop("actor_lr_scale", 1.0) or 1.0)
+        if self.actor_freeze_iterations < 0:
+            raise ValueError("actor_freeze_iterations must be >= 0.")
+        if self.actor_lr_scale < 0.0:
+            raise ValueError("actor_lr_scale must be >= 0.")
         actor_model = ServeHoverActorAdapter(policy)
         critic_model = ServeHoverCriticAdapter(policy)
 
@@ -688,8 +705,32 @@ class ServeHoverMaskedPPO(PPO):
 
         if self.rnd or self.symmetry:
             raise ValueError("ServeHoverMaskedPPO currently supports plain PPO only.")
+        self._hover_actor_parameters = policy.hover_actor_parameters()
+        self._hover_critic_parameters = policy.hover_critic_parameters()
         self._hover_parameters = policy.hover_parameters()
-        self.optimizer = optim.Adam(self._hover_parameters, lr=self.learning_rate)
+        self._serve_hover_update_count = 0
+        self._last_rollout_post_hit_samples = 0
+        self._last_rollout_post_hit_fraction = 0.0
+        self.optimizer = optim.Adam(
+            [
+                {"params": self._hover_actor_parameters, "lr": self.learning_rate, "name": "hover_actor"},
+                {"params": self._hover_critic_parameters, "lr": self.learning_rate, "name": "hover_critic"},
+            ],
+            lr=self.learning_rate,
+        )
+        self._set_optimizer_lrs()
+
+    def _is_actor_frozen(self) -> bool:
+        return self._serve_hover_update_count < self.actor_freeze_iterations
+
+    def _set_optimizer_lrs(self) -> None:
+        actor_lr = 0.0 if self._is_actor_frozen() else self.learning_rate * self.actor_lr_scale
+        for idx, param_group in enumerate(self.optimizer.param_groups):
+            group_name = param_group.get("name")
+            if group_name == "hover_actor" or (group_name is None and idx == 0):
+                param_group["lr"] = actor_lr
+            else:
+                param_group["lr"] = self.learning_rate
 
     @staticmethod
     def _mask_obs_batch(obs_batch: TensorDict, mask: torch.Tensor) -> TensorDict:
@@ -802,11 +843,55 @@ class ServeHoverMaskedPPO(PPO):
             masks_batch,
         )
 
+    def _get_post_hit_storage_mask(self) -> torch.Tensor:
+        mask_key = "serve_hover_mask" if "serve_hover_mask" in self.storage.observations.keys() else "post_hit_mask"
+        post_hit_mask = self.storage.observations[mask_key].squeeze(-1) >= 0.5
+        post_hit_count = int(post_hit_mask.sum().item())
+        total_count = int(post_hit_mask.numel())
+        self._last_rollout_post_hit_samples = post_hit_count
+        self._last_rollout_post_hit_fraction = float(post_hit_count) / float(max(total_count, 1))
+        return post_hit_mask
+
+    def _normalize_post_hit_advantages(self) -> None:
+        post_hit_mask = self._get_post_hit_storage_mask()
+        if self._last_rollout_post_hit_samples == 0:
+            return
+
+        hover_advantages = self.storage.advantages[post_hit_mask]
+        hover_std = hover_advantages.std(unbiased=False).clamp_min(1.0e-8)
+        self.storage.advantages[post_hit_mask] = (hover_advantages - hover_advantages.mean()) / hover_std
+
+    def compute_returns(self, obs: TensorDict) -> None:
+        # Compute raw GAE locally so post-hit advantages can be normalized only on
+        # the samples that are actually used to update the hover policy.
+        last_values = self.policy.evaluate(obs).detach()
+        advantage = torch.zeros_like(last_values)
+
+        for step in reversed(range(self.storage.rewards.shape[0])):
+            next_values = last_values if step == self.storage.rewards.shape[0] - 1 else self.storage.values[step + 1]
+            next_is_not_terminal = 1.0 - self.storage.dones[step].float()
+            delta = (
+                self.storage.rewards[step]
+                + next_is_not_terminal * self.gamma * next_values
+                - self.storage.values[step]
+            )
+            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+            self.storage.returns[step] = advantage + self.storage.values[step]
+
+        self.storage.advantages = self.storage.returns - self.storage.values
+        if not self.normalize_advantage_per_mini_batch:
+            self._normalize_post_hit_advantages()
+        else:
+            self._get_post_hit_storage_mask()
+
     def update(self) -> dict[str, float]:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         processed_batches = 0
+        hover_sample_count = 0
+        actor_frozen = self._is_actor_frozen()
+        self._set_optimizer_lrs()
 
         if self.policy.is_recurrent:
             raise ValueError("ServeHoverMaskedPPO does not support recurrent policies.")
@@ -825,9 +910,12 @@ class ServeHoverMaskedPPO(PPO):
                 _hidden_states_batch,
                 _masks_batch,
             ) = self._unpack_batch(batch)
-            hover_mask = obs_batch["post_hit_mask"].squeeze(-1) >= 0.5
-            if not bool(torch.any(hover_mask)):
+            mask_key = "serve_hover_mask" if "serve_hover_mask" in obs_batch.keys() else "post_hit_mask"
+            hover_mask = obs_batch[mask_key].squeeze(-1) >= 0.5
+            batch_hover_samples = int(hover_mask.sum().item())
+            if batch_hover_samples == 0:
                 continue
+            hover_sample_count += batch_hover_samples
 
             obs_batch = self._mask_obs_batch(obs_batch, hover_mask)
             actions_batch = actions_batch[hover_mask]
@@ -840,7 +928,9 @@ class ServeHoverMaskedPPO(PPO):
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    advantages_batch = (
+                        advantages_batch - advantages_batch.mean()
+                    ) / advantages_batch.std(unbiased=False).clamp_min(1.0e-8)
 
             self.policy.act(obs_batch)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
@@ -871,8 +961,7 @@ class ServeHoverMaskedPPO(PPO):
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    self._set_optimizer_lrs()
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -906,12 +995,19 @@ class ServeHoverMaskedPPO(PPO):
             mean_entropy += entropy_batch.mean().item()
 
         self.storage.clear()
+        self._serve_hover_update_count += 1
         if processed_batches == 0:
             return {
                 "value_function": 0.0,
                 "surrogate": 0.0,
                 "entropy": 0.0,
                 "hover_batches": 0.0,
+                "hover_samples": float(hover_sample_count),
+                "rollout_post_hit_samples": float(self._last_rollout_post_hit_samples),
+                "rollout_post_hit_fraction": float(self._last_rollout_post_hit_fraction),
+                "hover_action_std": 0.0,
+                "actor_frozen": float(actor_frozen),
+                "actor_freeze_remaining": float(max(self.actor_freeze_iterations - self._serve_hover_update_count, 0)),
             }
 
         return {
@@ -919,6 +1015,12 @@ class ServeHoverMaskedPPO(PPO):
             "surrogate": mean_surrogate_loss / processed_batches,
             "entropy": mean_entropy / processed_batches,
             "hover_batches": float(processed_batches),
+            "hover_samples": float(hover_sample_count),
+            "rollout_post_hit_samples": float(self._last_rollout_post_hit_samples),
+            "rollout_post_hit_fraction": float(self._last_rollout_post_hit_fraction),
+            "hover_action_std": float(self.policy.action_std.mean().item()),
+            "actor_frozen": float(actor_frozen),
+            "actor_freeze_remaining": float(max(self.actor_freeze_iterations - self._serve_hover_update_count, 0)),
         }
 
 
@@ -1039,7 +1141,15 @@ class ServeHoverOnPolicyRunner(OnPolicyRunner):
         alg_kwargs.pop("critic", None)
         alg_kwargs.pop("storage", None)
         multi_gpu_cfg = self.cfg.get("multi_gpu")
-        alg = ServeHoverMaskedPPO(policy, storage=storage, device=self.device, **alg_kwargs, multi_gpu_cfg=multi_gpu_cfg)
+        alg = ServeHoverMaskedPPO(
+            policy,
+            storage=storage,
+            device=self.device,
+            actor_freeze_iterations=self.cfg.get("serve_hover_actor_freeze_iterations", 0),
+            actor_lr_scale=self.cfg.get("serve_hover_actor_lr_scale", 1.0),
+            **alg_kwargs,
+            multi_gpu_cfg=multi_gpu_cfg,
+        )
         return alg
 
     def save(self, path: str, infos: dict | None = None) -> None:
@@ -1077,13 +1187,25 @@ class ServeHoverOnPolicyRunner(OnPolicyRunner):
                 build_combined_model_state_from_split_checkpoint(hover_checkpoint), strict=True
             )
             if load_optimizer and "hover_optimizer_state_dict" in loaded_dict:
-                self.alg.optimizer.load_state_dict(loaded_dict["hover_optimizer_state_dict"])
+                try:
+                    self.alg.optimizer.load_state_dict(loaded_dict["hover_optimizer_state_dict"])
+                except ValueError as exc:
+                    print(f"[WARN] Skipping incompatible hover optimizer state: {exc}")
             self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+            if hasattr(self.alg, "_serve_hover_update_count"):
+                self.alg._serve_hover_update_count = self.current_learning_iteration
+                self.alg._set_optimizer_lrs()
             return loaded_dict.get("infos")
 
         model_state_dict = loaded_dict["model_state_dict"]
         policy.load_state_dict(model_state_dict, strict=True)
         if load_optimizer and "optimizer_state_dict" in loaded_dict:
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            try:
+                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            except ValueError as exc:
+                print(f"[WARN] Skipping incompatible optimizer state: {exc}")
         self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+        if hasattr(self.alg, "_serve_hover_update_count"):
+            self.alg._serve_hover_update_count = self.current_learning_iteration
+            self.alg._set_optimizer_lrs()
         return loaded_dict.get("infos")

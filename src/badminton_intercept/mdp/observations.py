@@ -115,6 +115,7 @@ def build_serve_hover_observations(
     hit_point_rel=None,
     hover_target_pos=None,
     post_hit_mask=None,
+    serve_hover_mask=None,
     prev_action=None,
     privileged: dict | None = None,
     add_actor_noise: bool = False,
@@ -127,7 +128,8 @@ def build_serve_hover_observations(
     - task2_critic_obs: frozen task2 critic input
     - policy: hover actor input = drone_pos + rotmat + lin_vel + ang_vel + prev_action
     - critic: hover critic input
-    - post_hit_mask: phase selector used by the dual policy / PPO mask
+    - post_hit_mask: raw post-hit phase flag
+    - serve_hover_mask: delayed phase selector used by the dual policy / PPO mask
 
     Policy obs structure (23 dims):
         0-2:   drone_pos (3)
@@ -146,6 +148,7 @@ def build_serve_hover_observations(
             "policy": zeros_hover,
             "critic": zeros_hover,
             "post_hit_mask": [[0.0]],
+            "serve_hover_mask": [[0.0]],
         }
 
     task2_obs = build_actor_critic_observations(
@@ -167,6 +170,10 @@ def build_serve_hover_observations(
         post_hit_mask = torch.zeros((drone_pos.shape[0], 1), dtype=drone_pos.dtype, device=drone_pos.device)
     elif post_hit_mask.dim() == 1:
         post_hit_mask = post_hit_mask.unsqueeze(-1)
+    if serve_hover_mask is None:
+        serve_hover_mask = post_hit_mask
+    elif serve_hover_mask.dim() == 1:
+        serve_hover_mask = serve_hover_mask.unsqueeze(-1)
     if prev_action is None:
         prev_action = torch.zeros((drone_pos.shape[0], 4), dtype=drone_pos.dtype, device=drone_pos.device)
 
@@ -191,4 +198,5 @@ def build_serve_hover_observations(
         "policy": hover_actor,
         "critic": hover_critic,
         "post_hit_mask": post_hit_mask.to(dtype=hover_actor.dtype),
+        "serve_hover_mask": serve_hover_mask.to(dtype=hover_actor.dtype),
     }

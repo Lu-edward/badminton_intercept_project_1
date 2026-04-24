@@ -45,6 +45,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--enable_post_hit_tracking", action="store_true", default=False, help="Enable post-hit tracking mode for task 2")
     parser.add_argument("--enable_serve_hover", action="store_true", default=False, help="Enable two-stage serve-hover training")
     parser.add_argument("--prehit_checkpoint", type=str, default=None, help="Task2 checkpoint used to initialize the frozen pre-hit actor/critic")
+    parser.add_argument("--serve_hover_actor_freeze_iterations", type=int, default=0, help="Freeze serve-hover actor updates for the first N PPO iterations.")
+    parser.add_argument("--serve_hover_actor_lr_scale", type=float, default=1.0, help="Scale serve-hover actor LR after the freeze period.")
     parser.add_argument("--wandb", action="store_true", default=False, help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="badminton_intercept", help="Wandb project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team/username)")
@@ -636,6 +638,8 @@ def main() -> None:
     if args_cli.enable_serve_hover:
         runner_cfg.enable_serve_hover = True
         runner_cfg.prehit_checkpoint_path = args_cli.prehit_checkpoint or ""
+        runner_cfg.serve_hover_actor_freeze_iterations = args_cli.serve_hover_actor_freeze_iterations
+        runner_cfg.serve_hover_actor_lr_scale = args_cli.serve_hover_actor_lr_scale
         if args_cli.learning_rate is None:
             runner_cfg.algorithm.learning_rate = 1e-4
 
@@ -671,6 +675,8 @@ def main() -> None:
                 "freeze_curriculum_stage": args_cli.freeze_curriculum_stage,
                 "enable_serve_hover": args_cli.enable_serve_hover,
                 "prehit_checkpoint": args_cli.prehit_checkpoint,
+                "serve_hover_actor_freeze_iterations": args_cli.serve_hover_actor_freeze_iterations,
+                "serve_hover_actor_lr_scale": args_cli.serve_hover_actor_lr_scale,
                 "curriculum_promote_success_rate": env_cfg.curriculum_promote_success_rate,
                 "curriculum_promote_iteration_streak": env_cfg.curriculum_promote_iteration_streak,
             },

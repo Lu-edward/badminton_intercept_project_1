@@ -154,6 +154,7 @@ def compute_dones_serve_hover(
 
     Active termination conditions:
     - drone height out of range
+    - drone x out of range (x <= 0.1)
     - wrong_hit (pre-hit invalid contact or post-hit contact)
     - drone_net_collision (drone body hits net after ball is hit)
     - timeout
@@ -183,6 +184,9 @@ def compute_dones_serve_hover(
     high_height = drone_pos_w[:, 2] > max_height
     height_out_of_range = low_height | high_height
 
+    # x方向边界：无人机越过底线进入对方半场（x <= -3视为出界）
+    x_out_of_range = drone_pos_w[:, 0] <= 0.1
+
     post_hit_contact = contact & has_hit_ball
     wrong_hit = post_hit_contact
 
@@ -190,7 +194,7 @@ def compute_dones_serve_hover(
     # the hover phase. The env masks out the first hit-transition frame before calling.
     net_collision = drone_net_collision & has_hit_ball
 
-    terminated = height_out_of_range | wrong_hit | net_collision
+    terminated = height_out_of_range | wrong_hit | net_collision | x_out_of_range
     if episode_length_buf is None or max_episode_length is None:
         truncated = torch.zeros(num_envs, dtype=torch.bool, device=device)
     else:
@@ -204,6 +208,7 @@ def compute_dones_serve_hover(
 
     reason_masks = {
         "height_out_of_range": height_out_of_range,
+        "x_out_of_range": x_out_of_range,
         "wrong_hit": wrong_hit,
         "wrong_hit_post_contact": post_hit_contact,
         "hover_phase_reached": has_hit_ball,

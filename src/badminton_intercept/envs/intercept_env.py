@@ -140,7 +140,6 @@ class InterceptEnv(DirectRLEnv):
         self.enable_post_hit_tracking = bool(getattr(cfg, "enable_post_hit_tracking", False))
         self.post_hit = None
         self._just_entered_post_hit = None
-        self._serve_hover_target_pos = None
         self._serve_hover_termination_rewards = None
         self._hit_drone_pos_w = None
         self._hit_drone_quat_w = None
@@ -167,11 +166,6 @@ class InterceptEnv(DirectRLEnv):
         if initial_stage_id is not None:
             self._curriculum.set_stage_by_id(int(initial_stage_id))
 
-        if torch is not None:
-            self._serve_hover_target_pos = torch.tensor(
-                (-2.0, 0.0, 1.25),
-                dtype=torch.float32,
-            )
 
         if ISAACLAB_RUNTIME_AVAILABLE:
             super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
@@ -1163,24 +1157,26 @@ class InterceptEnv(DirectRLEnv):
             return
         if not self.enable_post_hit_tracking:
             return
-        trajectory_mode = getattr(self.cfg, "post_hit_trajectory_mode", "physx")
-        if trajectory_mode != "analytical":
-            return
         if self.post_hit is None or not self.post_hit.any():
             return
         if self._post_hit_trajectory_updated:
+            return
+
+        post_hit_mask = self.post_hit
+        sim_dt = self._get_step_dt_s()
+
+        # Increment time elapsed since hit for post-hit environments
+        self._hit_time_elapsed[post_hit_mask] += sim_dt
+
+        trajectory_mode = getattr(self.cfg, "post_hit_trajectory_mode", "physx")
+        if trajectory_mode != "analytical":
+            self._post_hit_trajectory_updated = True
             return
 
         from badminton_intercept.physics.shuttle_aero import (
             get_trajectory_point_batch,
             get_trajectory_velocity_batch,
         )
-
-        post_hit_mask = self.post_hit
-        sim_dt = float(getattr(self.cfg, "sim_dt", 0.005))
-
-        # Increment time elapsed since hit for post-hit environments
-        self._hit_time_elapsed[post_hit_mask] += sim_dt
 
         hit_pos = self._hit_ball_pos_w[post_hit_mask]
         hit_vel = self._hit_ball_vel_w[post_hit_mask]
@@ -1203,6 +1199,20 @@ class InterceptEnv(DirectRLEnv):
             self._shuttlecock.write_root_velocity_to_sim(vel_with_ang, env_ids=env_ids)
 
         self._post_hit_trajectory_updated = True
+
+    def _get_serve_hover_policy_mask(self, device=None) -> "torch.Tensor":
+        target_device = self.device if device is None else device
+        if torch is None:
+            return None
+        if self.post_hit is None:
+            return torch.zeros((self.num_envs,), dtype=torch.bool, device=target_device)
+
+        delay_steps = int(getattr(self.cfg, "serve_hover_policy_delay_steps", 5) or 0)
+        if delay_steps <= 0 or self._hit_time_elapsed is None:
+            return self.post_hit.to(device=target_device)
+
+        delay_s = delay_steps * self._get_step_dt_s()
+        return (self.post_hit & (self._hit_time_elapsed >= (delay_s - 1.0e-9))).to(device=target_device)
 
     def _get_step_dt_s(self) -> float:
         sim_cfg = getattr(self.cfg, "sim", None)
@@ -1301,13 +1311,14 @@ class InterceptEnv(DirectRLEnv):
                 "ball_mass": self._shuttle_mass_kg,
             }
             if self.enable_serve_hover:
-                hover_target = self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype)
-                hover_target = hover_target.unsqueeze(0).expand(self.num_envs, -1)
                 post_hit_mask = (
                     self.post_hit.unsqueeze(-1)
                     if self.post_hit is not None
                     else torch.zeros((self.num_envs, 1), device=drone_pos_local.device, dtype=torch.bool)
                 )
+                serve_hover_mask = self._get_serve_hover_policy_mask(device=drone_pos_local.device)
+                if serve_hover_mask.dim() == 1:
+                    serve_hover_mask = serve_hover_mask.unsqueeze(-1)
                 obs = build_serve_hover_observations(
                     drone_pos=drone_pos_local,
                     drone_quat_w=drone_quat_w,
@@ -1317,8 +1328,8 @@ class InterceptEnv(DirectRLEnv):
                     ball_lin_vel=ball_lin_vel_w,
                     hit_time_s=self._launch_hit_time_s,
                     hit_point_rel=hit_point_rel_w,
-                    hover_target_pos=hover_target,
                     post_hit_mask=post_hit_mask,
+                    serve_hover_mask=serve_hover_mask,
                     prev_action=self._prev_actions,
                     privileged=privileged,
                     add_actor_noise=True,
@@ -1377,6 +1388,7 @@ class InterceptEnv(DirectRLEnv):
                 ball_pos_local,
                 ball_lin_vel_w,
             )
+            serve_hover_policy_mask = self._get_serve_hover_policy_mask(device=drone_pos_local.device)
 
             if self.enable_serve_hover:
                 from badminton_intercept.mdp.rewards import compute_rewards_serve_hover
@@ -1388,7 +1400,11 @@ class InterceptEnv(DirectRLEnv):
                     drone_lin_vel_w=drone_lin_vel_w,
                     ball_pos_w=task2_ball_pos_local,
                     has_hit_ball=self.post_hit,
-                    hover_target_pos=self._serve_hover_target_pos.to(device=drone_pos_local.device, dtype=drone_pos_local.dtype),
+                    serve_hover_mask=serve_hover_policy_mask,
+                    action=self._actions,
+                    prev_action=self._prev_actions,
+                    yaw=yaw,
+                    bound_dist=bound_dist,
                 )
                 total_reward = rewards["total"]
                 if self._serve_hover_termination_rewards is not None:
@@ -1705,7 +1721,7 @@ class InterceptEnv(DirectRLEnv):
                         # ============================================================
                         # Serve Hover 日志（与 task2 日志完全独立）
                         # reason_masks keys from compute_dones_serve_hover:
-                        #   height_out_of_range, wrong_hit, wrong_hit_post_contact,
+                        #   height_out_of_range, x_out_of_range, wrong_hit, wrong_hit_post_contact,
                         #   hover_phase_reached, timeout, timeout_without_hit,
                         #   drone_net_collision
                         # ============================================================
@@ -1724,12 +1740,14 @@ class InterceptEnv(DirectRLEnv):
                         timeout_mask = reason_masks.get("timeout", zero_mask)
                         drone_net_collision_mask = reason_masks.get("drone_net_collision", zero_mask)
                         weak_hit_failure_mask = reason_masks.get("weak_hit_failure", zero_mask)
+                        x_boundary_mask = reason_masks.get("x_out_of_range", zero_mask)
 
                         height_out_count = int((post_hit_done_mask & height_out).sum().item())
                         wrong_hit_count = int((post_hit_done_mask & wrong_hit_mask).sum().item())
                         timeout_count = int((post_hit_done_mask & timeout_mask).sum().item())
                         drone_net_collision_count = int((post_hit_done_mask & drone_net_collision_mask).sum().item())
                         weak_hit_failure_count = int((done_mask & weak_hit_failure_mask).sum().item())
+                        x_boundary_count = int((post_hit_done_mask & x_boundary_mask).sum().item())
 
                         wrong_post_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_post_contact", zero_mask)).sum().item())
 
@@ -1743,6 +1761,7 @@ class InterceptEnv(DirectRLEnv):
                         summary["serve_hover_wrong_hit_rate"] = float(wrong_hit_count / denom)
                         summary["serve_hover_timeout_rate"] = float(timeout_count / denom)
                         summary["serve_hover_drone_net_collision_rate"] = float(drone_net_collision_count / denom)
+                        summary["serve_hover_x_boundary_rate"] = float(x_boundary_count / denom)
                         summary["pre_hit_weak_hit_failure_rate"] = float(weak_hit_failure_count / float(max(num_resets, 1)))
 
                         # 错误击球细分
