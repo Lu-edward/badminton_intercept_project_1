@@ -147,7 +147,7 @@ def compute_dones_serve_hover(
     episode_length_buf=None,
     max_episode_length: int | None = None,
     min_height: float = 0.1,
-    max_height: float = 4.0,
+    max_height: float = 8.0,
     return_reason_masks: bool = False,
 ):
     """Termination logic for serve-hover training.
@@ -184,8 +184,8 @@ def compute_dones_serve_hover(
     high_height = drone_pos_w[:, 2] > max_height
     height_out_of_range = low_height | high_height
 
-    # x方向边界：无人机越过底线进入对方半场（x <= -3视为出界）
-    x_out_of_range = drone_pos_w[:, 0] <= 0.1
+    # x方向边界：无人机越过底线进入对方半场（x <= 0.125视为出界）
+    x_out_of_range = drone_pos_w[:, 0] <= 0.125
 
     post_hit_contact = contact & has_hit_ball
     wrong_hit = post_hit_contact

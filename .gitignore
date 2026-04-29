@@ -9,3 +9,9 @@ scripts/*
 scripts/__pycache__/
 scripts/test/
 logs/
+.trellis/
+.agents/
+.claude/
+.codex/
+
+AGENTS.md

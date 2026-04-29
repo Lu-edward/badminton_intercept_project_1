@@ -314,6 +314,18 @@ def extract_model_state_dict(checkpoint_payload: dict[str, Any]) -> dict[str, to
     return checkpoint_payload
 
 
+def is_single_actor_critic_state_dict(model_state: dict[str, Any]) -> bool:
+    has_single_branch_keys = any(
+        key.startswith(("actor.", "critic.", "actor_obs_normalizer.", "critic_obs_normalizer.", "log_std", "std"))
+        for key in model_state.keys()
+    )
+    has_dual_branch_keys = any(
+        key.startswith(("task2_actor_critic.", "hover_actor_critic."))
+        for key in model_state.keys()
+    )
+    return has_single_branch_keys and not has_dual_branch_keys
+
+
 def split_actor_critic_state_dict(actor_critic: CompatActorCritic) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     actor_state: dict[str, torch.Tensor] = {}
     critic_state: dict[str, torch.Tensor] = {}
@@ -384,6 +396,7 @@ class ServeHoverDualActorCritic(nn.Module):
             checkpoint_payload = torch.load(prehit_checkpoint_path, weights_only=False, map_location="cpu")
             model_state = extract_model_state_dict(checkpoint_payload)
             self.task2_actor_critic.load_state_dict(model_state, strict=True)
+            self.hover_actor_critic.load_state_dict(model_state, strict=True)
 
         for parameter in self.task2_actor_critic.parameters():
             parameter.requires_grad = False
@@ -1197,7 +1210,16 @@ class ServeHoverOnPolicyRunner(OnPolicyRunner):
                 self.alg._set_optimizer_lrs()
             return loaded_dict.get("infos")
 
-        model_state_dict = loaded_dict["model_state_dict"]
+        model_state_dict = extract_model_state_dict(loaded_dict)
+        if is_single_actor_critic_state_dict(model_state_dict):
+            policy.task2_actor_critic.load_state_dict(model_state_dict, strict=True)
+            policy.hover_actor_critic.load_state_dict(model_state_dict, strict=True)
+            self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+            if hasattr(self.alg, "_serve_hover_update_count"):
+                self.alg._serve_hover_update_count = self.current_learning_iteration
+                self.alg._set_optimizer_lrs()
+            return loaded_dict.get("infos")
+
         policy.load_state_dict(model_state_dict, strict=True)
         if load_optimizer and "optimizer_state_dict" in loaded_dict:
             try:

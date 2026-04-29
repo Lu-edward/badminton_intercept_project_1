@@ -1207,7 +1207,7 @@ class InterceptEnv(DirectRLEnv):
         if self.post_hit is None:
             return torch.zeros((self.num_envs,), dtype=torch.bool, device=target_device)
 
-        delay_steps = int(getattr(self.cfg, "serve_hover_policy_delay_steps", 5) or 0)
+        delay_steps = int(getattr(self.cfg, "serve_hover_policy_delay_steps", 1) or 0)
         if delay_steps <= 0 or self._hit_time_elapsed is None:
             return self.post_hit.to(device=target_device)
 
@@ -1388,19 +1388,14 @@ class InterceptEnv(DirectRLEnv):
                 ball_pos_local,
                 ball_lin_vel_w,
             )
-            serve_hover_policy_mask = self._get_serve_hover_policy_mask(device=drone_pos_local.device)
-
             if self.enable_serve_hover:
                 from badminton_intercept.mdp.rewards import compute_rewards_serve_hover
                 rewards = compute_rewards_serve_hover(
                     drone_pos=drone_pos_local,
                     drone_up_w=drone_up_w,
                     drone_ang_vel_w=drone_ang_vel_w,
-                    drone_quat_w=drone_quat_w,
-                    drone_lin_vel_w=drone_lin_vel_w,
                     ball_pos_w=task2_ball_pos_local,
                     has_hit_ball=self.post_hit,
-                    serve_hover_mask=serve_hover_policy_mask,
                     action=self._actions,
                     prev_action=self._prev_actions,
                     yaw=yaw,
