@@ -1,0 +1,89 @@
+# X152b quadrotor parameters derived from airgym and rlPx4Controller
+# Format corresponds to badminton_intercept_project_1/assets/air.yaml
+# MISSING fields are annotated inline.
+
+name: X152b
+update_sim: True          # MISSING: no equivalent simulation-update flag in airgym
+target_clip: 1.0          # MISSING: no equivalent action-clipping parameter in airgym
+max_thrust_ratio: 1.0     # MISSING: no equivalent thrust-limit ratio in airgym
+fixed_yaw: 0              # MISSING: no equivalent yaw-lock flag in airgym
+
+inertia:
+  xx: 0.04                # from model.urdf base_link <inertia>
+  xy: 0.0
+  xz: 0.0
+  yy: 0.04
+  yz: 0.0
+  zz: 0.04
+mass: 0.601               # 0.585 (base_link) + 4 * 0.004 (prop links), from model.urdf
+l: 0.152                  # diagonal motor distance ~ 2 * sqrt(0.05374^2 + 0.05374^2)
+drag_coef: 0.0            # MISSING: no aerodynamic drag model in airgym
+
+rotor_configuration:
+  arm_lengths:
+    - 0.076                # from URDF joint origin: sqrt(0.05374^2 + 0.05374^2)
+    - 0.076
+    - 0.076
+    - 0.076
+  directions:
+    - -1.0                 # prop_1 / prop_2 torque sign from airgym pre_physics_step
+    - -1.0
+    - 1.0                  # prop_3 / prop_4 torque sign from airgym pre_physics_step
+    - 1.0
+  force_constants:
+    # MISSING: airgym uses a linear thrust mapping F = PWM * 9.59 [N]
+    # (hardcoded in hovering.py / customized.py / maplanning.py / depthgen.py).
+    # There is no quadratic rotor model F = k_f * omega^2.
+    - null
+    - null
+    - null
+    - null
+  max_rotation_velocities:
+    # MISSING: no rotor-speed (rad/s) model or limit in airgym / rlPx4Controller.
+    - null
+    - null
+    - null
+    - null
+  moment_constants:
+    # MISSING: airgym uses a linear torque-thrust coupling tau = 0.2 * F [N*m].
+    # There is no quadratic rotor model tau = k_m * omega^2.
+    - null
+    - null
+    - null
+    - null
+  num_rotors: 4
+  rotor_angles:
+    # Derived from URDF joint origins (atan2(y, x), z-up frame):
+    # prop_1: ( 0.05374, -0.05374) ->  5.498 rad  (315 deg)
+    # prop_2: (-0.05374,  0.05374) ->  2.356 rad  (135 deg)
+    # prop_3: ( 0.05374,  0.05374) ->  0.785 rad  ( 45 deg)
+    # prop_4: (-0.05374, -0.05374) ->  3.927 rad  (225 deg)
+    - 5.498
+    - 2.356
+    - 0.785
+    - 3.927
+  time_constant: null      # MISSING: no first-order motor-dynamics lag in airgym
+  noise_scale: 0.0         # MISSING: no rotor-speed noise model in airgym
+
+controller_configuration:
+  # MISSING: air.yaml stores a single 3-element gain vector, but rlPx4Controller
+  # uses cascaded PID controllers with different gains per loop.
+  # The following rlPx4Controller gains CANNOT be collapsed into a single vector:
+  #   Position:  Kp = [1.5, 1.5, 1.5],  Kv = [1.5, 1.5, 1.5]   (SimplePositionController.hpp:78)
+  #   Attitude:  P  = [8.0, 8.0, 1.0],  rate_limit = [27.9, 27.9, 17.5] rad/s  (Px4AttitudeController.hpp:98)
+  #   Rate:      P  = [0.5, 0.5, 0.2],  I = [0.08, 0.08, 0.05],  D = [0.001, 0.001, 0.0]  (Px4RateController.hpp:85)
+  gain:
+    - null
+    - null
+    - null
+
+# ---------------------------------------------------------------------------
+# Additional airgym-specific parameters that have no field in air.yaml
+# ---------------------------------------------------------------------------
+airgym_thrust_scale: 9.59               # delta in hovering.py / customized.py: F = PWM * 9.59 [N]
+airgym_torque_thrust_ratio: 0.2         # tau = 0.2 * F [N*m], from pre_physics_step torque code
+airgym_hover_thrust_norm: 0.1533        # hover thrust setpoint [0,1], from SimplePositionController.hpp:67
+px4_mixer_roll_scale:  [-0.707107, 0.707107, 0.707107, -0.707107]   # from Px4Mixer.hpp
+px4_mixer_pitch_scale: [-0.707107, 0.707107, -0.707107, 0.707107]  # from Px4Mixer.hpp
+px4_mixer_yaw_scale:   [-1.0, -1.0, 1.0, 1.0]                       # from Px4Mixer.hpp
+px4_mixer_thrust_scale: [1.0, 1.0, 1.0, 1.0]                        # from Px4Mixer.hpp
