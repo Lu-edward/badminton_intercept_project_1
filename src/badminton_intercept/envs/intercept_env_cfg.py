@@ -4,7 +4,7 @@ from typing import Literal
 # === 统一修改点：无人机最大推力 (N) ===
 # 修改此值即可自动更新 ctbr_thrust_scale
 MAX_THRUST_NEWTON = 20
-_DRONE_MASS_KG = 0.9505  # 无人机+球拍总质量
+_DRONE_MASS_KG = 0.641  # X152b + racket total mass
 CTBR_THRUST_SCALE = MAX_THRUST_NEWTON / _DRONE_MASS_KG  
 
 try:
@@ -112,8 +112,9 @@ if ISAACLAB_CFG_AVAILABLE:
         # task-specific params
         env_name: str = "intercept"
         drone_asset_kind: str = "articulation"
-        drone_usd_path: str = "F:/eai/transfer/assets/air.usd"
+        drone_usd_path: str = "F:/eai/isaaclab/badminton_intercept_project_1/assets/X152b/model.usd"
         drone_param_yaml_path: str = ""
+        drone_control_mode: str = "x152b_airgym"
         drone_init_pos: tuple[float, float, float] = (2.0, 0.0, 1.2)
         drone_init_rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
         # FM-style CTBR scaling: rate*2pi, thrust*15.
@@ -121,7 +122,7 @@ if ISAACLAB_CFG_AVAILABLE:
         ctbr_thrust_scale: float = CTBR_THRUST_SCALE
         # Axis sign correction from CTBR command frame to simulation body-rate frame.
         # For current air.usd articulation, roll/pitch need sign flip to keep negative feedback.
-        ctbr_body_rate_axis_sign: tuple[float, float, float] = (-1.0, -1.0, 1.0)
+        ctbr_body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
         max_angular_accel_rad_s2: float = 3
         ctbr_max_thrust_ratio: float = 1.0
         fm_p_gain: tuple[float, float, float] = (0.11, 0.11, 0.2)
@@ -130,7 +131,7 @@ if ISAACLAB_CFG_AVAILABLE:
         fm_rate_k: tuple[float, float, float] = (1.0, 1.0, 1.0)
         fm_int_lim: tuple[float, float, float] = (1.0, 1.0, 1.0)
         fm_k_coef: float = 0.0178
-        fm_extra_mass_kg: float = 0.147
+        fm_extra_mass_kg: float = 0.0
         fm_rate_lpf_alpha: float = 0.803307
         fm_rate_lpf_beta: float = 0.196693
         max_linear_speed_mps: float = 20.0
@@ -212,13 +213,14 @@ else:
         sim_dt: float = 0.005
         episode_length_s: float = 4.0
         drone_asset_kind: str = "articulation"
-        drone_usd_path: str = "F:/eai/transfer/assets/air.usd"
+        drone_usd_path: str = "F:/eai/isaaclab/badminton_intercept_project_1/assets/X152b/model.usd"
         drone_param_yaml_path: str = ""
+        drone_control_mode: str = "x152b_airgym"
         drone_init_pos: tuple[float, float, float] = (2.0, 0.0, 1.2)
         drone_init_rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
         ctbr_rate_max_rad_s: float = 3.14  # π
         ctbr_thrust_scale: float = CTBR_THRUST_SCALE
-        ctbr_body_rate_axis_sign: tuple[float, float, float] = (-1.0, -1.0, 1.0)
+        ctbr_body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
         max_angular_accel_rad_s2: float = 3
         ctbr_max_thrust_ratio: float = 1.0
         fm_p_gain: tuple[float, float, float] = (0.11, 0.11, 0.2)
@@ -227,7 +229,7 @@ else:
         fm_rate_k: tuple[float, float, float] = (1.0, 1.0, 1.0)
         fm_int_lim: tuple[float, float, float] = (1.0, 1.0, 1.0)
         fm_k_coef: float = 0.0178
-        fm_extra_mass_kg: float = 0.147
+        fm_extra_mass_kg: float = 0.0
         fm_rate_lpf_alpha: float = 0.803307
         fm_rate_lpf_beta: float = 0.196693
         max_linear_speed_mps: float = 20.0

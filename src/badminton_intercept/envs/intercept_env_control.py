@@ -3,6 +3,8 @@ from __future__ import annotations
 from badminton_intercept.control.attitude_pd import compute_rate_pid_angacc
 from badminton_intercept.control.ctbr_decoder import decode_ctbr_action
 from badminton_intercept.control.rotor_mixer import rotor_thrust_to_body_wrench
+from badminton_intercept.control.x152b_ctbr_controller import compute_x152b_ctbr_wrench
+from badminton_intercept.control.x152b_params import DEFAULT_X152B_PARAMS
 from badminton_intercept.envs.intercept_env_cfg import CTBR_THRUST_SCALE
 from badminton_intercept.envs.intercept_env_common import ISAACLAB_RUNTIME_AVAILABLE, torch
 from badminton_intercept.physics.shuttle_aero import compute_drag_force_tensor
@@ -38,6 +40,33 @@ class InterceptEnvControlMixin:
 
         _, drone_quat_w, _, drone_ang_vel_w = self._get_drone_kinematics()
         body_rate_rad_s = self._quat_rotate_world_to_body(drone_quat_w, drone_ang_vel_w)
+        dt = float(getattr(self.cfg.sim, "dt", 1.0 / 200.0))
+
+        if str(getattr(self.cfg, "drone_control_mode", "")).lower() == "x152b_airgym":
+            control_out = compute_x152b_ctbr_wrench(
+                actions=self._actions,
+                body_rate_rad_s=body_rate_rad_s,
+                prev_filtered_body_rate_rad_s=self._filtered_body_rate_rad_s,
+                rate_integral=self._rate_integral,
+                dt=dt,
+                params=DEFAULT_X152B_PARAMS,
+                rate_scale_rad_s=float(self.cfg.ctbr_rate_max_rad_s),
+                body_rate_axis_sign=tuple(getattr(self.cfg, "ctbr_body_rate_axis_sign", (1.0, 1.0, 1.0))),
+            )
+            self._rate_integral = control_out.rate_integral
+            self._filtered_body_rate_rad_s = control_out.filtered_body_rate_rad_s
+            self._rotor_thrust_cmd_n = control_out.rotor_force_n
+
+            force_w = self._quat_rotate_body_to_world(drone_quat_w, control_out.body_force)
+            torque_w = self._quat_rotate_body_to_world(drone_quat_w, control_out.body_torque)
+            self._drone.instantaneous_wrench_composer.set_forces_and_torques(
+                forces=force_w.unsqueeze(1),
+                torques=torque_w.unsqueeze(1),
+                is_global=True,
+                body_ids=self._force_body_ids,
+            )
+            self._apply_external_forces()
+            return None
 
         effective_mass = self._mass_kg * self._drone_mass_scale + float(getattr(self.cfg, "fm_extra_mass_kg", 0.147))
         target_body_rate, target_thrust_ref = decode_ctbr_action(
@@ -52,7 +81,6 @@ class InterceptEnvControlMixin:
         ).unsqueeze(0)
         target_body_rate = target_body_rate * axis_sign
 
-        dt = float(getattr(self.cfg.sim, "dt", 1.0 / 200.0))
         p_gain = torch.tensor(getattr(self.cfg, "fm_p_gain", (0.11, 0.11, 0.2)), device=self.device).unsqueeze(0)
         i_gain = torch.tensor(getattr(self.cfg, "fm_i_gain", (0.008, 0.008, 0.01)), device=self.device).unsqueeze(0)
         d_gain = torch.tensor(getattr(self.cfg, "fm_d_gain", (0.00075, 0.00075, 0.0)), device=self.device).unsqueeze(0)

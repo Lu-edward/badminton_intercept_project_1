@@ -7,8 +7,8 @@ from dataclasses import dataclass
 class X152bParams:
     """Physical and controller constants for the AirGym X152b model.usd asset."""
 
-    mass_kg: float = 0.601
-    inertia_diag: tuple[float, float, float] = (0.04, 0.04, 0.04)
+    mass_kg: float = 0.641
+    inertia_diag: tuple[float, float, float] = (0.040545, 0.040545, 0.040288)
 
     rotor_positions_m: tuple[tuple[float, float, float], ...] = (
         (0.05374, -0.05374, 0.024),
@@ -25,7 +25,7 @@ class X152bParams:
 
     airgym_thrust_scale_n: float = 9.59
     airgym_torque_thrust_ratio_m: float = 0.2
-    airgym_hover_thrust_norm: float = 0.1533
+    airgym_hover_thrust_norm: float = 0.1635
 
     rate_p_gain: tuple[float, float, float] = (0.5, 0.5, 0.2)
     rate_i_gain: tuple[float, float, float] = (0.08, 0.08, 0.05)

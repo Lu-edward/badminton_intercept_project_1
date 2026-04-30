@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from badminton_intercept.control.x152b_params import DEFAULT_X152B_PARAMS
 from badminton_intercept.envs.intercept_env_common import ISAACLAB_RUNTIME_AVAILABLE, torch
 from badminton_intercept.physics.air_params import load_air_yaml_params
 from badminton_intercept.physics.shuttle_aero import compute_drag_force_tensor
@@ -49,6 +50,51 @@ class InterceptEnvRuntimeMixin:
         self._pending_weak_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._pending_weak_hit_age = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self._weak_hit_termination_rewards = torch.zeros((self.num_envs,), device=self.device)
+
+        if str(getattr(self.cfg, "drone_control_mode", "")).lower() == "x152b_airgym":
+            xp = DEFAULT_X152B_PARAMS
+            self._air_params = None
+            self._mass_kg = torch.full((self.num_envs,), float(xp.mass_kg), device=self.device)
+            self._inertia_diag = torch.tensor(xp.inertia_diag, device=self.device).unsqueeze(0).repeat(
+                self.num_envs, 1
+            )
+            self._arm_lengths_m = None
+            self._rotor_angles_rad = None
+            self._rotor_directions = torch.tensor(xp.rotor_directions, device=self.device)
+            self._force_constants = None
+            self._moment_constants = None
+            self._motor_time_constant_s = 0.0
+            self._rotor_noise_scale = 0.0
+            self._max_rotor_thrust_n = torch.full((4,), float(xp.airgym_thrust_scale_n), device=self.device)
+            num_rotors = 4
+            self._allocation_matrix_inv = None
+            self._rotor_thrust_cmd_n = torch.zeros((self.num_envs, num_rotors), device=self.device)
+            self._filtered_body_rate_rad_s = torch.zeros((self.num_envs, 3), device=self.device)
+            self._rate_integral = torch.zeros((self.num_envs, 3), device=self.device)
+            self._rotor_throttle = torch.zeros((self.num_envs, num_rotors), device=self.device)
+            self._prev_ball_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._prev_ball_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._prev_racket_contact_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._prev_racket_normal_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._contact_reference_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            self.post_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            self._just_entered_post_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            self._hit_drone_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._hit_drone_quat_w = torch.zeros((self.num_envs, 4), device=self.device)
+            self._hit_drone_quat_w[:, 0] = 1.0
+            self._hit_drone_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._hit_drone_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._hit_ball_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._hit_ball_vel_w = torch.zeros((self.num_envs, 3), device=self.device)
+            self._hit_time_elapsed = torch.zeros((self.num_envs,), device=self.device)
+            self._task2_server_ground_hold_active = torch.zeros(
+                (self.num_envs,), dtype=torch.bool, device=self.device
+            )
+            self._task2_server_ground_landing_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
+            self._task2_server_ground_hold_elapsed_s = torch.zeros((self.num_envs,), device=self.device)
+            self._resolve_force_body_ids()
+            self._resolve_racket_body_ids()
+            return
 
         self._air_params = load_air_yaml_params(self._resolve_air_yaml_path())
         ap = self._air_params
