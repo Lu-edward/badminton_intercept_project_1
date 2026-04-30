@@ -31,17 +31,59 @@ class SceneEntityConfigs:
     resolved_air_usd_path: str
 
 
+DEFAULT_DRONE_ASSET_KIND = "articulation"
+DEFAULT_DRONE_USD_PATH = "F:/eai/isaaclab/badminton_intercept_project_1/assets/X152b/model.usd"
+_DRONE_ASSET_KIND_ALIASES = {
+    "rigid": "rigid_object",
+    "rigid_object": "rigid_object",
+    "articulation": "articulation",
+}
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_drone_asset_kind(cfg: Any) -> str:
+    configured = str(getattr(cfg, "drone_asset_kind", DEFAULT_DRONE_ASSET_KIND)).strip().lower()
+    if not configured:
+        configured = DEFAULT_DRONE_ASSET_KIND
+    drone_kind = _DRONE_ASSET_KIND_ALIASES.get(configured)
+    if drone_kind is None:
+        valid = ", ".join(sorted(_DRONE_ASSET_KIND_ALIASES))
+        raise ValueError(f"Unsupported drone_asset_kind={configured!r}. Expected one of: {valid}.")
+    return drone_kind
+
+
 def _resolve_air_usd_path(cfg: Any) -> str:
     override = os.environ.get("BADMINTON_AIR_USD")
-    configured = getattr(cfg, "drone_usd_path", "")
-    candidate = override or configured
+    configured = str(getattr(cfg, "drone_usd_path", DEFAULT_DRONE_USD_PATH)).strip()
+    if not configured:
+        configured = DEFAULT_DRONE_USD_PATH
+    if override:
+        candidate = Path(override)
+        if candidate.exists():
+            return str(candidate)
+        raise FileNotFoundError(
+            "BADMINTON_AIR_USD does not point to an existing USD file: "
+            f"{override}"
+        )
+
+    candidate_paths: list[Path] = []
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            candidate_paths.append(configured_path)
+        else:
+            candidate_paths.append(_PROJECT_ROOT / configured_path)
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return str(candidate)
 
     # Keep this strict for early error surfacing in IsaacLab mode.
-    if not candidate or not Path(candidate).exists():
-        raise FileNotFoundError(
-            "air.usd not found. Set InterceptEnvCfg.drone_usd_path or BADMINTON_AIR_USD to a valid path."
-        )
-    return candidate
+    tried = ", ".join(str(path) for path in candidate_paths) or "<empty>"
+    raise FileNotFoundError(
+        "Drone USD not found. Set InterceptEnvCfg.drone_usd_path or BADMINTON_AIR_USD to a valid path. "
+        f"Tried: {tried}"
+    )
 
 
 def spawn_drone_with_racket(asset_path: str) -> str:
@@ -57,7 +99,7 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
         return SceneHandles()
 
     air_usd_path = _resolve_air_usd_path(cfg)
-    drone_kind = getattr(cfg, "drone_asset_kind", "articulation").lower()
+    drone_kind = _resolve_drone_asset_kind(cfg)
 
     if drone_kind == "rigid_object":
         drone_cfg = RigidObjectCfg(
@@ -77,7 +119,6 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
             ),
         )
     else:
-        drone_kind = "articulation"
         drone_cfg = ArticulationCfg(
             prim_path="/World/envs/env_.*/Drone",
             spawn=sim_utils.UsdFileCfg(
@@ -96,6 +137,8 @@ def build_scene(config: dict[str, Any]) -> SceneHandles | SceneEntityConfigs:
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=tuple(getattr(cfg, "drone_init_pos", (2.0, 0.0, 1.2))),
                 rot=tuple(getattr(cfg, "drone_init_rot", (1.0, 0.0, 0.0, 0.0))),
+                joint_pos={},
+                joint_vel={},
             ),
             actuators={},
         )
