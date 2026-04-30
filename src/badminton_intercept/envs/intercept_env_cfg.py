@@ -121,7 +121,6 @@ if ISAACLAB_CFG_AVAILABLE:
         ctbr_rate_max_rad_s: float = 3.14  # 2π
         ctbr_thrust_scale: float = CTBR_THRUST_SCALE
         # Axis sign correction from CTBR command frame to simulation body-rate frame.
-        # For current air.usd articulation, roll/pitch need sign flip to keep negative feedback.
         ctbr_body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
         max_angular_accel_rad_s2: float = 3
         ctbr_max_thrust_ratio: float = 1.0
