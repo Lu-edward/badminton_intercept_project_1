@@ -139,8 +139,7 @@ class InterceptEnvMDPMixin:
 
             # 任务二模式：使用 compute_rewards_task2
             if self.enable_post_hit_tracking:
-                from badminton_intercept.mdp.rewards import compute_rewards_task2, compute_racket_normal_x_component
-                normal_x = compute_racket_normal_x_component(drone_quat_w)
+                from badminton_intercept.mdp.rewards import compute_rewards_task2
 
                 rewards = compute_rewards_task2(
                     racket_pos_w=racket_pos_local,
@@ -157,6 +156,7 @@ class InterceptEnvMDPMixin:
                     drone_lin_vel_w=drone_lin_vel_w,
                     drone_pos_w=drone_pos_local,
                     drone_quat_w=drone_quat_w,
+                    racket_normal_w=racket_normal_w,
                     episode_length_buf=self.episode_length_buf,
                     max_episode_length=self.max_episode_length,
                     has_hit_ball=self.post_hit,
@@ -237,9 +237,7 @@ class InterceptEnvMDPMixin:
             safe_bounds = {"x": (0.0, 6.7), "y": (-3.05, 3.05), "z": (0.2, 3.0)}  # 最下面不低于20cm
 
             if self.enable_serve_hover:
-                from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
-
-                normal_x = compute_racket_normal_x_component(drone_quat_w)
+                normal_x = racket_normal_w[:, 0]
                 correct_posture = normal_x < 0.0
                 just_entered_post_hit = self._just_entered_post_hit if self._just_entered_post_hit is not None else torch.zeros_like(contact)
                 post_hit_active = self.post_hit & (~just_entered_post_hit)
@@ -373,9 +371,7 @@ class InterceptEnvMDPMixin:
                 if non_post_hit.any():
                     contact_masked = contact[non_post_hit].clone()
                     # 遮蔽掉那些刚被击中（且姿态正确）的 envs，让它们转入 post-hit 而非立即终止
-                    from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
-                    normal_x = compute_racket_normal_x_component(drone_quat_w[non_post_hit])
-                    correct_posture = normal_x < 0.0
+                    correct_posture = racket_normal_w[non_post_hit, 0] < 0.0
                     transitioning_to_post_hit = contact[non_post_hit] & correct_posture
                     contact_for_dones = contact_masked & ~transitioning_to_post_hit
 

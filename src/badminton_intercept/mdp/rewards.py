@@ -205,6 +205,7 @@ def compute_rewards_task2(
     drone_lin_vel_w=None,
     drone_pos_w=None,
     drone_quat_w=None,
+    racket_normal_w=None,
     episode_length_buf=None,
     max_episode_length=None,
     has_hit_ball=None,
@@ -261,7 +262,10 @@ def compute_rewards_task2(
         has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     # ── Phase 1: 击球阶段 ──────────────────────────────────────────────
-    normal_x = compute_racket_normal_x_component(drone_quat_w)
+    if racket_normal_w is not None:
+        normal_x = racket_normal_w[:, 0]
+    else:
+        normal_x = compute_racket_normal_x_component(drone_quat_w)
     correct_posture = (normal_x < 0.0).float()
     r_hit = c_hit * contact_f * correct_posture
 

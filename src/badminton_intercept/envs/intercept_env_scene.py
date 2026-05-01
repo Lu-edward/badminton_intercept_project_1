@@ -108,7 +108,7 @@ class InterceptEnvSceneMixin:
             return
 
         prim_path_exprs = (
-            "/World/envs/env_.*/Drone",
+            "/World/envs/env_.*/Drone.*",
             "/World/envs/env_.*/ShuttlecockProxy",
             "/World/envs/env_.*/Net",
         )
