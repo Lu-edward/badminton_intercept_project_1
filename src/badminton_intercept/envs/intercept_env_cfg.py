@@ -145,7 +145,7 @@ if ISAACLAB_CFG_AVAILABLE:
         shuttle_mass_kg: float = 0.005
         shuttle_init_pos: tuple[float, float, float] = (-2.0, 0.0, 1.6)
         racket_offset_z_m: float = 0.2
-        contact_radius_m: float = 0.09
+        contact_radius_m: float = 0.11
         racket_body_name_expr: str = ".*[Bb]at.*"
         contact_force_threshold: float = 1.0
         hit_normal_velocity_delta_threshold_mps: float = 1.0
@@ -243,7 +243,7 @@ else:
         shuttle_mass_kg: float = 0.005
         shuttle_init_pos: tuple[float, float, float] = (-2.0, 0.0, 1.6)
         racket_offset_z_m: float = 0.2
-        contact_radius_m: float = 0.09
+        contact_radius_m: float = 0.11
         racket_body_name_expr: str = ".*[Bb]at.*"
         contact_force_threshold: float = 1.0
         hit_normal_velocity_delta_threshold_mps: float = 1.0

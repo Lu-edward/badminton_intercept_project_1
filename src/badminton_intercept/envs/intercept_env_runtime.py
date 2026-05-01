@@ -331,7 +331,7 @@ class InterceptEnvRuntimeMixin:
                         sensor_contact = force_mag.max(dim=1)[0].max(dim=1)[0] > threshold
             except Exception:
                 sensor_contact = torch.zeros_like(geometric_contact)
-            # Always use sensor OR geometric contact; weak_hit logic is disabled
+            # Always use sensor OR geometric contact; weak_hit logic is disabled.
             candidate_contact = sensor_contact | geometric_contact
 
         velocity_confirmed = self._compute_hit_velocity_confirmation(
@@ -341,109 +341,25 @@ class InterceptEnvRuntimeMixin:
         )
         contact = candidate_contact & velocity_confirmed
 
-        prev_weak_hit_failure = (
-            self._last_weak_hit_failure.clone()
-            if self._last_weak_hit_failure is not None
-            else torch.zeros_like(contact)
-        )
         weak_hit_failure = torch.zeros_like(contact)
-        weak_hit_failure_start_steps = torch.zeros_like(contact, dtype=torch.long)
-        if self.enable_post_hit_tracking and self.post_hit is not None:
-            from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
-
-            _, drone_quat_w_for_hit, _, _ = self._get_drone_kinematics()
-            normal_x_for_hit = compute_racket_normal_x_component(drone_quat_w_for_hit)
-            correct_posture_for_hit = normal_x_for_hit < 0.0
-            pre_hit_mask = ~self.post_hit
-            weak_hit_candidate = (
-                geometric_contact
-                & (~sensor_contact)
-                & velocity_confirmed
-                & correct_posture_for_hit
-                & pre_hit_mask
-                & has_racket_sensor
-            )
-            sensor_hit = sensor_contact & correct_posture_for_hit & pre_hit_mask
-            if self._pending_weak_hit is not None and self._pending_weak_hit_age is not None:
-                pending_sensor_hit = self._pending_weak_hit & sensor_hit
-                contact = contact | pending_sensor_hit
-                cancel_pending = self._pending_weak_hit & (sensor_hit | self.post_hit)
-                self._pending_weak_hit[cancel_pending] = False
-                self._pending_weak_hit_age[cancel_pending] = 0
-
-                new_pending = weak_hit_candidate & (~self._pending_weak_hit)
-                self._pending_weak_hit[new_pending] = True
-                self._pending_weak_hit_age[new_pending] = int(self.common_step_counter)
-                if new_pending.any() and bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
-                    env_id = int(torch.nonzero(new_pending, as_tuple=False)[0].item())
-                    print(
-                        "[DEBUG] weak_hit_pending_enter: "
-                        f"env={env_id}, step={int(self.common_step_counter)}, "
-                        f"sensor={bool(sensor_contact[env_id].item())}, "
-                        f"geom={bool(geometric_contact[env_id].item())}, "
-                        f"instant_dist={float(instant_dist[env_id].item()):.4f}, "
-                        f"swept_dist={float(swept_dist[env_id].item()):.4f}, "
-                        f"racket_ball_force={float(sensor_max_force[env_id].item()):.4f}"
-                    )
-
-                active_pending = self._pending_weak_hit & pre_hit_mask & (~sensor_hit)
-                grace_steps = int(getattr(self.cfg, "weak_hit_sensor_grace_steps", 4))
-                pending_elapsed_steps = int(self.common_step_counter) - self._pending_weak_hit_age
-                weak_hit_failure = active_pending & (pending_elapsed_steps >= max(grace_steps, 0))
-                weak_hit_failure_start_steps = torch.where(
-                    weak_hit_failure,
-                    self._pending_weak_hit_age,
-                    weak_hit_failure_start_steps,
-                )
-                self._pending_weak_hit[weak_hit_failure] = False
-                self._pending_weak_hit_age[weak_hit_failure] = 0
-            else:
-                weak_hit_failure = weak_hit_candidate
-                weak_hit_failure_start_steps = torch.where(
-                    weak_hit_failure,
-                    torch.full_like(weak_hit_failure_start_steps, int(self.common_step_counter)),
-                    weak_hit_failure_start_steps,
-                )
-
-        newly_weak_hit_failure = weak_hit_failure & (~prev_weak_hit_failure)
-        weak_hit_failure = weak_hit_failure | prev_weak_hit_failure
+        if self._pending_weak_hit is not None:
+            self._pending_weak_hit[:] = False
+        if self._pending_weak_hit_age is not None:
+            self._pending_weak_hit_age[:] = 0
 
         self._last_sensor_hit = sensor_contact & velocity_confirmed
         self._last_geometric_hit = geometric_contact & velocity_confirmed
         self._last_weak_hit_failure = weak_hit_failure
 
-        if newly_weak_hit_failure.any() and bool(getattr(self.cfg, "drone_net_contact_debug_print", False)):
-            env_id = int(torch.nonzero(newly_weak_hit_failure, as_tuple=False)[0].item())
-            delta_vn = torch.zeros_like(contact, dtype=torch.float32)
-            if (
-                ball_lin_vel_w is not None
-                and racket_normal_w is not None
-                and self._prev_ball_lin_vel_w is not None
-                and self._prev_racket_normal_w is not None
-            ):
-                normal_ref = self._prev_racket_normal_w
-                normal_ref = normal_ref / torch.linalg.norm(normal_ref, dim=-1, keepdim=True).clamp_min(1.0e-6)
-                vn_prev = torch.sum(self._prev_ball_lin_vel_w * normal_ref, dim=-1)
-                vn_post = torch.sum(ball_lin_vel_w * normal_ref, dim=-1)
-                delta_vn = torch.abs(vn_post - vn_prev)
-            print(
-                "[DEBUG] weak_hit_failure: "
-                f"env={env_id}, pending_start_step={int(weak_hit_failure_start_steps[env_id].item())}, "
-                f"step={int(self.common_step_counter)}, "
-                f"current_sensor={bool(sensor_contact[env_id].item())}, "
-                f"current_geom={bool(geometric_contact[env_id].item())}, "
-                f"instant_dist={float(instant_dist[env_id].item()):.4f}, "
-                f"swept_dist={float(swept_dist[env_id].item()):.4f}, "
-                f"racket_ball_force={float(sensor_max_force[env_id].item()):.4f}, "
-                f"delta_vn={float(delta_vn[env_id].item()):.4f}"
-            )
-
         # 任务二模式：更新 post-hit 标志并保存 hit 时刻的状态
         # 只有当击球姿态正确（球拍朝向对方场地，normal_x < 0）时才追踪球
         if self.enable_post_hit_tracking and self.post_hit is not None and contact.any():
-            from badminton_intercept.mdp.rewards import compute_racket_normal_x_component
             drone_pos_w, drone_quat_w, drone_lin_vel_w, drone_ang_vel_w = self._get_drone_kinematics()
-            normal_x = compute_racket_normal_x_component(drone_quat_w)
+            normal_x = (
+                racket_normal_w[:, 0]
+                if racket_normal_w is not None
+                else self._quat_to_up_axis_w(drone_quat_w)[:, 0]
+            )
             correct_posture = normal_x < 0.0
 
             newly_hit = contact & (~self.post_hit) & correct_posture
