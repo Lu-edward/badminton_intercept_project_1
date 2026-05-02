@@ -41,6 +41,7 @@ class InterceptEnvControlMixin:
         _, drone_quat_w, _, drone_ang_vel_w = self._get_drone_kinematics()
         body_rate_rad_s = self._quat_rotate_world_to_body(drone_quat_w, drone_ang_vel_w)
         dt = float(getattr(self.cfg.sim, "dt", 1.0 / 200.0))
+        effective_mass = self._mass_kg * self._drone_mass_scale + float(getattr(self.cfg, "fm_extra_mass_kg", 0.147))
 
         if str(getattr(self.cfg, "drone_control_mode", "")).lower() == "x152b_airgym":
             control_out = compute_x152b_ctbr_wrench(
@@ -49,8 +50,10 @@ class InterceptEnvControlMixin:
                 prev_filtered_body_rate_rad_s=self._filtered_body_rate_rad_s,
                 rate_integral=self._rate_integral,
                 dt=dt,
+                effective_mass_kg=effective_mass,
                 params=DEFAULT_X152B_PARAMS,
                 rate_scale_rad_s=float(self.cfg.ctbr_rate_max_rad_s),
+                thrust_scale=float(getattr(self.cfg, "ctbr_thrust_scale", CTBR_THRUST_SCALE)),
                 body_rate_axis_sign=tuple(getattr(self.cfg, "ctbr_body_rate_axis_sign", (1.0, 1.0, 1.0))),
             )
             self._rate_integral = control_out.rate_integral
@@ -68,7 +71,6 @@ class InterceptEnvControlMixin:
             self._apply_external_forces()
             return None
 
-        effective_mass = self._mass_kg * self._drone_mass_scale + float(getattr(self.cfg, "fm_extra_mass_kg", 0.147))
         target_body_rate, target_thrust_ref = decode_ctbr_action(
             self._actions,
             rate_scale_rad_s=float(self.cfg.ctbr_rate_max_rad_s),
