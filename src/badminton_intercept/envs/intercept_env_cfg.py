@@ -1,9 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
+from badminton_intercept.control.x152b_params import DEFAULT_X152B_PARAMS
+
 # === 统一修改点：无人机最大推力 (N) ===
 # 修改此值即可自动更新 ctbr_thrust_scale
-MAX_THRUST_NEWTON = 20
+MAX_THRUST_NEWTON = DEFAULT_X152B_PARAMS.airgym_thrust_scale_n * len(DEFAULT_X152B_PARAMS.rotor_positions_m)
 _DRONE_MASS_KG = 0.641  # X152b + racket total mass
 CTBR_THRUST_SCALE = MAX_THRUST_NEWTON / _DRONE_MASS_KG  
 

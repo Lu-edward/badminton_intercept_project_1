@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from badminton_intercept.control.ctbr_decoder import decode_ctbr_action
 from badminton_intercept.control.x152b_airgym_mixer import mix_px4_quad_x_to_airgym_wrench
 from badminton_intercept.control.x152b_params import DEFAULT_X152B_PARAMS, X152bParams
 
@@ -18,6 +19,8 @@ class X152bCtbrControlOutput:
     rotor_pwm: "torch.Tensor"
     rotor_force_n: "torch.Tensor"
     target_body_rate_rad_s: "torch.Tensor"
+    target_thrust_ref: "torch.Tensor"
+    thrust_cmd: "torch.Tensor"
     rate_control: "torch.Tensor"
     rate_integral: "torch.Tensor"
     filtered_body_rate_rad_s: "torch.Tensor"
@@ -67,10 +70,11 @@ def compute_x152b_ctbr_wrench(
     prev_filtered_body_rate_rad_s: "torch.Tensor",
     rate_integral: "torch.Tensor",
     dt: float,
+    effective_mass_kg: "torch.Tensor | float",
     params: X152bParams = DEFAULT_X152B_PARAMS,
     rate_scale_rad_s: float = 3.141592653589793,
-    thrust_min: float = 0.0,
-    thrust_max: float = 1.0,
+    thrust_scale: float = 15.0,
+    max_total_thrust_n: float | None = None,
     body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> X152bCtbrControlOutput:
     """Compute body-frame wrench for X152b from normalized CTBR policy actions."""
@@ -83,10 +87,25 @@ def compute_x152b_ctbr_wrench(
     if actions.shape[0] != body_rate_rad_s.shape[0]:
         raise ValueError("actions and body_rate_rad_s must have the same batch dimension")
 
+    effective_mass = torch.as_tensor(effective_mass_kg, device=actions.device, dtype=actions.dtype)
+    if effective_mass.ndim == 0:
+        effective_mass = effective_mass.expand(actions.shape[0])
+    elif effective_mass.shape != (actions.shape[0],):
+        raise ValueError(f"Expected effective_mass_kg shape ({actions.shape[0]},), got {tuple(effective_mass.shape)}")
+
+    if max_total_thrust_n is None:
+        max_total_thrust_n = float(params.airgym_thrust_scale_n) * len(params.rotor_positions_m)
+    max_total_thrust_n = max(float(max_total_thrust_n), 1.0e-6)
+
+    target_body_rate_rad_s, target_thrust_ref = decode_ctbr_action(
+        actions,
+        rate_scale_rad_s=rate_scale_rad_s,
+        thrust_scale=thrust_scale,
+    )
     axis_sign = torch.tensor(body_rate_axis_sign, device=actions.device, dtype=actions.dtype).unsqueeze(0)
-    target_body_rate_rad_s = actions[:, 0:3].clamp(-1.0, 1.0) * float(rate_scale_rad_s) * axis_sign
-    thrust_cmd = float(thrust_min) + ((actions[:, 3] + 1.0) * 0.5) * (float(thrust_max) - float(thrust_min))
-    thrust_cmd = thrust_cmd.clamp(min=float(thrust_min), max=float(thrust_max))
+    target_body_rate_rad_s = target_body_rate_rad_s * axis_sign
+    desired_total_thrust_n = target_thrust_ref * effective_mass
+    thrust_cmd = (desired_total_thrust_n / max_total_thrust_n).clamp(0.0, 1.0)
 
     rate_control, rate_integral, filtered_rate = compute_x152b_rate_control(
         target_body_rate_rad_s=target_body_rate_rad_s,
@@ -107,6 +126,8 @@ def compute_x152b_ctbr_wrench(
         rotor_pwm=rotor_pwm,
         rotor_force_n=rotor_force_n,
         target_body_rate_rad_s=target_body_rate_rad_s,
+        target_thrust_ref=target_thrust_ref,
+        thrust_cmd=thrust_cmd,
         rate_control=rate_control,
         rate_integral=rate_integral,
         filtered_body_rate_rad_s=filtered_rate,
