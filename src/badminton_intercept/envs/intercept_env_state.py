@@ -66,10 +66,6 @@ class InterceptEnvStateMixin:
         self._last_launch_stats = {}
         self._last_sensor_hit = None
         self._last_geometric_hit = None
-        self._last_weak_hit_failure = None
-        self._pending_weak_hit = None
-        self._pending_weak_hit_age = None
-        self._weak_hit_termination_rewards = None
         self._prev_ball_pos_w = None
         self._prev_ball_lin_vel_w = None
         self._prev_racket_contact_pos_w = None

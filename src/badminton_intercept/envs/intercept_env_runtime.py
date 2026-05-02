@@ -46,10 +46,6 @@ class InterceptEnvRuntimeMixin:
         self._last_contact = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._last_sensor_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._last_geometric_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-        self._last_weak_hit_failure = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-        self._pending_weak_hit = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-        self._pending_weak_hit_age = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
-        self._weak_hit_termination_rewards = torch.zeros((self.num_envs,), device=self.device)
 
         if str(getattr(self.cfg, "drone_control_mode", "")).lower() == "x152b_airgym":
             xp = DEFAULT_X152B_PARAMS
@@ -331,7 +327,6 @@ class InterceptEnvRuntimeMixin:
                         sensor_contact = force_mag.max(dim=1)[0].max(dim=1)[0] > threshold
             except Exception:
                 sensor_contact = torch.zeros_like(geometric_contact)
-            # Always use sensor OR geometric contact; weak_hit logic is disabled.
             candidate_contact = sensor_contact | geometric_contact
 
         velocity_confirmed = self._compute_hit_velocity_confirmation(
@@ -341,15 +336,8 @@ class InterceptEnvRuntimeMixin:
         )
         contact = candidate_contact & velocity_confirmed
 
-        weak_hit_failure = torch.zeros_like(contact)
-        if self._pending_weak_hit is not None:
-            self._pending_weak_hit[:] = False
-        if self._pending_weak_hit_age is not None:
-            self._pending_weak_hit_age[:] = 0
-
         self._last_sensor_hit = sensor_contact & velocity_confirmed
         self._last_geometric_hit = geometric_contact & velocity_confirmed
-        self._last_weak_hit_failure = weak_hit_failure
 
         # 任务二模式：更新 post-hit 标志并保存 hit 时刻的状态
         # 只有当击球姿态正确（球拍朝向对方场地，normal_x < 0）时才追踪球

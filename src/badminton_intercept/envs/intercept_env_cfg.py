@@ -118,7 +118,7 @@ if ISAACLAB_CFG_AVAILABLE:
         drone_init_pos: tuple[float, float, float] = (2.0, 0.0, 1.2)
         drone_init_rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
         # FM-style CTBR scaling: rate*2pi, thrust*15.
-        ctbr_rate_max_rad_s: float = 3.14  # 2π
+        ctbr_rate_max_rad_s: float = 6.0
         ctbr_thrust_scale: float = CTBR_THRUST_SCALE
         # Axis sign correction from CTBR command frame to simulation body-rate frame.
         ctbr_body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -153,8 +153,6 @@ if ISAACLAB_CFG_AVAILABLE:
         net_contact_force_threshold: float = 0.05
         drone_net_contact_force_threshold: float = 15.0
         drone_net_contact_debug_print: bool = False
-        weak_hit_reward: float = 5
-        weak_hit_sensor_grace_steps: int = 2
         net_width_m: float = 6.5
         ground_restitution: float = 0.1
         nominal_drag_length_m: float = 4.1
@@ -217,7 +215,7 @@ else:
         drone_control_mode: str = "x152b_airgym"
         drone_init_pos: tuple[float, float, float] = (2.0, 0.0, 1.2)
         drone_init_rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
-        ctbr_rate_max_rad_s: float = 3.14  # π
+        ctbr_rate_max_rad_s: float = 6.0
         ctbr_thrust_scale: float = CTBR_THRUST_SCALE
         ctbr_body_rate_axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0)
         max_angular_accel_rad_s2: float = 3
@@ -251,8 +249,6 @@ else:
         net_contact_force_threshold: float = 0.05
         drone_net_contact_force_threshold: float = 15.0
         drone_net_contact_debug_print: bool = False
-        weak_hit_reward: float = 5
-        weak_hit_sensor_grace_steps: int = 2
         net_width_m: float = 6.5
         ground_restitution: float = 0.1
         nominal_drag_length_m: float = 4.1

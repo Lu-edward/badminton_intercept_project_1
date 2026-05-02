@@ -83,9 +83,8 @@ def compute_x152b_ctbr_wrench(
     if actions.shape[0] != body_rate_rad_s.shape[0]:
         raise ValueError("actions and body_rate_rad_s must have the same batch dimension")
 
-    actions = torch.tanh(actions)
     axis_sign = torch.tensor(body_rate_axis_sign, device=actions.device, dtype=actions.dtype).unsqueeze(0)
-    target_body_rate_rad_s = actions[:, 0:3] * float(rate_scale_rad_s) * axis_sign
+    target_body_rate_rad_s = actions[:, 0:3].clamp(-1.0, 1.0) * float(rate_scale_rad_s) * axis_sign
     thrust_cmd = float(thrust_min) + ((actions[:, 3] + 1.0) * 0.5) * (float(thrust_max) - float(thrust_min))
     thrust_cmd = thrust_cmd.clamp(min=float(thrust_min), max=float(thrust_max))
 

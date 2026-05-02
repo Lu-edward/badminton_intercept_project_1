@@ -234,7 +234,6 @@ def compute_dones(
     drone_pos_w=None,
     contact=None,
     net_contact=None,
-    weak_hit_failure=None,
     drone_up_w=None,
     drone_bottom_z=None,
     episode_length_buf=None,
@@ -256,9 +255,7 @@ def compute_dones(
     success = contact
     if net_contact is None:
         net_contact = torch.zeros_like(success)
-    if weak_hit_failure is None:
-        weak_hit_failure = torch.zeros_like(success)
-    failure_net = (~success) & (~weak_hit_failure) & net_contact
+    failure_net = (~success) & net_contact
 
     ball_z = ball_pos_w[:, 2]
     racket_z = racket_pos_w[:, 2]
@@ -267,10 +264,9 @@ def compute_dones(
     in_drone_half = ball_pos_w[:, 0] > 0.0  # 球在无人机半场
     ball_below_racket = ball_z < racket_z_threshold
     ball_grounded = ball_z <= z_threshold
-    failure_server_side_grounded = (~success) & (~weak_hit_failure) & (~failure_net) & (~in_drone_half) & ball_grounded
+    failure_server_side_grounded = (~success) & (~failure_net) & (~in_drone_half) & ball_grounded
     failure_ball = (
         (~success)
-        & (~weak_hit_failure)
         & (~failure_net)
         & (~failure_server_side_grounded)
         & in_drone_half
@@ -295,7 +291,6 @@ def compute_dones(
         )
         failure_bounds = (
             (~success)
-            & (~weak_hit_failure)
             & (~failure_net)
             & (~failure_server_side_grounded)
             & (~failure_ball)
@@ -308,7 +303,6 @@ def compute_dones(
         # z-axis facing down means unstable/flip-like posture
         failure_tilt = (
             (~success)
-            & (~weak_hit_failure)
             & (~failure_net)
             & (~failure_server_side_grounded)
             & (~failure_ball)
@@ -318,7 +312,6 @@ def compute_dones(
 
     terminated = (
         success
-        | weak_hit_failure
         | failure_net
         | failure_server_side_grounded
         | failure_ball
@@ -336,7 +329,6 @@ def compute_dones(
 
     reason_masks = {
         "success_contact": success,
-        "weak_hit_failure": weak_hit_failure,
         "failure_net_contact": failure_net,
         "failure_server_side_grounded": failure_server_side_grounded,
         "failure_ball_drop": failure_ball,

@@ -133,8 +133,6 @@ class InterceptEnvMDPMixin:
                 total_reward = rewards["total"]
                 if self._serve_hover_termination_rewards is not None:
                     total_reward = total_reward + self._serve_hover_termination_rewards
-                if self._weak_hit_termination_rewards is not None:
-                    total_reward = total_reward + self._weak_hit_termination_rewards
                 return total_reward
 
             # 任务二模式：使用 compute_rewards_task2
@@ -162,10 +160,7 @@ class InterceptEnvMDPMixin:
                     has_hit_ball=self.post_hit,
                     c_ang_vel=float(getattr(self.cfg, "reward_c_ang_vel", 0.05)),
                 )
-                total_reward = rewards["total"]
-                if self._weak_hit_termination_rewards is not None:
-                    total_reward = total_reward + self._weak_hit_termination_rewards
-                return total_reward
+                return rewards["total"]
 
             # 任务一模式：使用原有奖励函数
             rewards = compute_rewards(
@@ -206,22 +201,6 @@ class InterceptEnvMDPMixin:
             net_contact = self._compute_net_contact_signal()
             drone_net_contact = self._compute_drone_net_contact_signal()
             self._last_contact = contact.clone()
-            weak_hit_failure = (
-                self._last_weak_hit_failure.clone()
-                if self._last_weak_hit_failure is not None
-                else torch.zeros_like(contact)
-            )
-            pending_weak_hit = (
-                self._pending_weak_hit.clone()
-                if self._pending_weak_hit is not None
-                else torch.zeros_like(contact)
-            )
-            weak_hit_reward = float(getattr(self.cfg, "weak_hit_reward", 5))
-            self._weak_hit_termination_rewards = torch.where(
-                weak_hit_failure,
-                torch.full((self.num_envs,), weak_hit_reward, dtype=ball_pos_w.dtype, device=self.device),
-                torch.zeros((self.num_envs,), dtype=ball_pos_w.dtype, device=self.device),
-            )
             self._serve_hover_termination_rewards = torch.zeros((self.num_envs,), dtype=ball_pos_w.dtype, device=self.device)
             drone_up_w = self._quat_to_up_axis_w(drone_quat_w)
             drone_pos_local = drone_pos_w
@@ -290,7 +269,6 @@ class InterceptEnvMDPMixin:
                         drone_bottom_z=drone_bottom_z[pre_hit_envs],
                         contact=contact_for_prehit,
                         net_contact=net_contact[pre_hit_envs],
-                        weak_hit_failure=weak_hit_failure[pre_hit_envs],
                         drone_up_w=drone_up_w[pre_hit_envs],
                         episode_length_buf=self.episode_length_buf[pre_hit_envs],
                         max_episode_length=self.max_episode_length,
@@ -299,11 +277,6 @@ class InterceptEnvMDPMixin:
                         return_reason_masks=True,
                     )
                     truncated_pre = truncated_pre & (~just_entered_post_hit[pre_hit_envs])
-                    pending_pre = pending_weak_hit[pre_hit_envs] & (~weak_hit_failure[pre_hit_envs])
-                    terminated_pre = terminated_pre & (~pending_pre)
-                    truncated_pre = truncated_pre & (~pending_pre)
-                    for key, mask in reason_masks_pre.items():
-                        reason_masks_pre[key] = mask & (~pending_pre)
                     terminated[pre_hit_envs] = terminated_pre
                     truncated[pre_hit_envs] = truncated_pre
                     for key, mask in reason_masks_pre.items():
@@ -382,7 +355,6 @@ class InterceptEnvMDPMixin:
                         drone_bottom_z=drone_bottom_z[non_post_hit],
                         contact=contact_for_dones,
                         net_contact=net_contact[non_post_hit],
-                        weak_hit_failure=weak_hit_failure[non_post_hit],
                         drone_up_w=drone_up_w[non_post_hit],
                         episode_length_buf=self.episode_length_buf[non_post_hit],
                         max_episode_length=self.max_episode_length,
@@ -392,11 +364,6 @@ class InterceptEnvMDPMixin:
                     )
                     # 遮蔽 transition 时刻的 timeout，避免 episode 时间到了就打断转入 post-hit
                     truncated_non = truncated_non & ~transitioning_to_post_hit
-                    pending_non = pending_weak_hit[non_post_hit] & (~weak_hit_failure[non_post_hit])
-                    terminated_non = terminated_non & (~pending_non)
-                    truncated_non = truncated_non & (~pending_non)
-                    for key, mask in reason_masks_non.items():
-                        reason_masks_non[key] = mask & (~pending_non)
                     terminated[non_post_hit] = terminated_non
                     truncated[non_post_hit] = truncated_non
 
@@ -416,7 +383,6 @@ class InterceptEnvMDPMixin:
                     drone_bottom_z=drone_bottom_z,  # 传递最下面高度用于z边界判定
                     contact=contact,
                     net_contact=net_contact,
-                    weak_hit_failure=weak_hit_failure,
                     drone_up_w=drone_up_w,
                     episode_length_buf=self.episode_length_buf,
                     max_episode_length=self.max_episode_length,
@@ -424,11 +390,6 @@ class InterceptEnvMDPMixin:
                     z_threshold=0.1,
                     return_reason_masks=True,
                 )
-                pending_running = pending_weak_hit & (~weak_hit_failure)
-                terminated = terminated & (~pending_running)
-                truncated = truncated & (~pending_running)
-                for key, mask in reason_masks.items():
-                    reason_masks[key] = mask & (~pending_running)
                 self._last_done_reasons = reason_masks
             
             if hasattr(self, "extras"):
@@ -459,14 +420,12 @@ class InterceptEnvMDPMixin:
                         wrong_hit_mask = reason_masks.get("wrong_hit", zero_mask)
                         timeout_mask = reason_masks.get("timeout", zero_mask)
                         drone_net_collision_mask = reason_masks.get("drone_net_collision", zero_mask)
-                        weak_hit_failure_mask = reason_masks.get("weak_hit_failure", zero_mask)
                         x_boundary_mask = reason_masks.get("x_out_of_range", zero_mask)
 
                         height_out_count = int((post_hit_done_mask & height_out).sum().item())
                         wrong_hit_count = int((post_hit_done_mask & wrong_hit_mask).sum().item())
                         timeout_count = int((post_hit_done_mask & timeout_mask).sum().item())
                         drone_net_collision_count = int((post_hit_done_mask & drone_net_collision_mask).sum().item())
-                        weak_hit_failure_count = int((done_mask & weak_hit_failure_mask).sum().item())
                         x_boundary_count = int((post_hit_done_mask & x_boundary_mask).sum().item())
 
                         wrong_post_count = int((post_hit_done_mask & reason_masks.get("wrong_hit_post_contact", zero_mask)).sum().item())
@@ -482,7 +441,6 @@ class InterceptEnvMDPMixin:
                         summary["serve_hover_timeout_rate"] = float(timeout_count / denom)
                         summary["serve_hover_drone_net_collision_rate"] = float(drone_net_collision_count / denom)
                         summary["serve_hover_x_boundary_rate"] = float(x_boundary_count / denom)
-                        summary["pre_hit_weak_hit_failure_rate"] = float(weak_hit_failure_count / float(max(num_resets, 1)))
 
                         # 错误击球细分
                         summary["serve_hover_wrong_hit_post_rate"] = float(wrong_post_count / denom)
@@ -534,7 +492,6 @@ class InterceptEnvMDPMixin:
                         # rates live on the same denominator and sum to ~1 together.
                         pre_hit_remaining = pre_hit_done_mask.clone()
                         pre_hit_category_masks = (
-                            ("pre_hit_weak_hit_failure_rate", reason_masks.get("weak_hit_failure", zero_mask)),
                             ("pre_hit_failure_net_contact_rate", reason_masks.get("failure_net_contact", zero_mask)),
                             ("pre_hit_failure_server_side_grounded_rate", reason_masks.get("failure_server_side_grounded", zero_mask)),
                             ("pre_hit_failure_ball_drop_rate", reason_masks.get("failure_ball_drop", zero_mask)),

@@ -431,14 +431,6 @@ class InterceptEnvResetMixin:
                 self._last_sensor_hit[env_ids] = False
             if self._last_geometric_hit is not None:
                 self._last_geometric_hit[env_ids] = False
-            if self._last_weak_hit_failure is not None:
-                self._last_weak_hit_failure[env_ids] = False
-            if self._pending_weak_hit is not None:
-                self._pending_weak_hit[env_ids] = False
-            if self._pending_weak_hit_age is not None:
-                self._pending_weak_hit_age[env_ids] = 0
-            if self._weak_hit_termination_rewards is not None:
-                self._weak_hit_termination_rewards[env_ids] = 0.0
             if self._serve_hover_termination_rewards is not None:
                 self._serve_hover_termination_rewards[env_ids] = 0.0
             if self.post_hit is not None:
