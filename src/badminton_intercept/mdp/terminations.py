@@ -259,8 +259,8 @@ def compute_dones(
 
     ball_z = ball_pos_w[:, 2]
     racket_z = racket_pos_w[:, 2]
-    # 球低于球拍阈值（球拍z - 5cm），且球在无人机所在半场（x > 0）时终止
-    racket_z_threshold = racket_z - 0.05  # 球拍z - 5cm
+    # 球低于球拍阈值（球拍z - 20cm），且球在无人机所在半场（x > 0）时终止
+    racket_z_threshold = racket_z - 0.20  # 球拍z - 20cm
     in_drone_half = ball_pos_w[:, 0] > 0.0  # 球在无人机半场
     ball_below_racket = ball_z < racket_z_threshold
     ball_grounded = ball_z <= z_threshold
