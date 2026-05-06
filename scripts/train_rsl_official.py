@@ -264,7 +264,6 @@ def _load_finetune_checkpoint(runner: OnPolicyRunner, checkpoint_path: str) -> N
 
 
 def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
-    # rsl-rl 5.0+ uses logger.log instead of runner.log
     original_log = None
     if hasattr(runner, "log"):
         original_log = runner.log
@@ -274,12 +273,54 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
         print("[WARN] Could not find log method for wandb patching. Skipping wandb log.")
         return
 
-    def _wandb_log(**locs) -> None:
-        # Call original log with same kwargs
-        original_log(**locs)
+    EPISODE_METRIC_KEYS = (
+        "success_rate",
+        "success_contact",
+        "post_hit_rate",
+        "wrong_hit_rate",
+        "num_resets",
+        "curriculum_stage_id",
+        "failure_server_side_grounded",
+        "failure_server_side_grounded_rate",
+        "failure_net_contact_rate",
+        "failure_ball_drop_rate",
+        "failure_out_of_bounds_rate",
+        "failure_tilt_rate",
+        "timeout_rate",
+    )
+
+    def _resolve_locs(*args, **kwargs) -> dict:
+        """Resolve the locs dict from either new-style (positional dict) or old-style (kwargs)."""
+        if args and isinstance(args[0], dict):
+            return args[0]
+        return kwargs
+
+    def _extract_episode_metrics(ep_infos: list) -> dict[str, float]:
+        if not ep_infos or not ep_infos[0]:
+            return {}
+        result: dict[str, float] = {}
+        for key in ep_infos[0]:
+            values: list[float] = []
+            for ep_info in ep_infos:
+                if key not in ep_info:
+                    continue
+                val = ep_info[key]
+                if isinstance(val, torch.Tensor):
+                    if val.numel() == 1:
+                        values.append(float(val.item()))
+                    elif val.numel() > 1:
+                        values.append(float(val.float().mean().item()))
+                elif isinstance(val, (int, float)):
+                    values.append(float(val))
+            if values:
+                result[key] = float(sum(values) / len(values))
+        return result
+
+    def _wandb_log(*args, **kwargs) -> None:
+        original_log(*args, **kwargs)
+        locs = _resolve_locs(*args, **kwargs)
         policy = _get_runner_policy(runner)
 
-        # Try different std attributes (rsl-rl 5.0+ uses output_std or distribution.std)
         mean_std = 0.0
         if hasattr(policy, "output_std"):
             mean_std = float(policy.output_std.mean().item())
@@ -292,37 +333,39 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
             "iteration": float(locs.get("it", 0)),
             "collect_time": float(locs.get("collect_time", 0)),
             "learn_time": float(locs.get("learn_time", 0)),
-            "learning_rate": float(locs.get("learning_rate", 0)),
             "Policy/mean_noise_std": mean_std,
         }
+        if locs.get("learning_rate") is not None:
+            wandb_metrics["learning_rate"] = float(locs["learning_rate"])
+
         loss_dict = locs.get("loss_dict", {})
         for key, value in loss_dict.items():
             if isinstance(value, (int, float)):
                 wandb_metrics[f"Loss/{key}"] = float(value)
 
-        if locs.get("mean_reward") is not None:
+        # Train/mean_reward: new rsl-rl stores in rewbuffer deque (need statistics.mean)
+        rewbuffer = locs.get("rewbuffer")
+        if rewbuffer and len(rewbuffer) > 0:
+            wandb_metrics["Train/mean_reward"] = statistics.mean(rewbuffer)
+        elif locs.get("mean_reward") is not None:
             wandb_metrics["Train/mean_reward"] = float(locs["mean_reward"])
-        if locs.get("mean_episode_length") is not None:
+
+        # Train/mean_episode_length
+        lenbuffer = locs.get("lenbuffer")
+        if lenbuffer and len(lenbuffer) > 0:
+            wandb_metrics["Train/mean_episode_length"] = statistics.mean(lenbuffer)
+        elif locs.get("mean_episode_length") is not None:
             wandb_metrics["Train/mean_episode_length"] = float(locs["mean_episode_length"])
 
-        if locs.get("extras"):
+        # Episode/* metrics: new rsl-rl uses ep_infos list, old uses extras dict
+        ep_infos = locs.get("ep_infos")
+        if ep_infos and isinstance(ep_infos, list):
+            for key, value in _extract_episode_metrics(ep_infos).items():
+                wandb_metrics[f"Episode/{key}"] = value
+        elif locs.get("extras"):
             extras = locs["extras"]
             if isinstance(extras, dict):
-                for key in (
-                    "success_rate",
-                    "success_contact",
-                    "post_hit_rate",
-                    "wrong_hit_rate",
-                    "num_resets",
-                    "curriculum_stage_id",
-                    "failure_server_side_grounded",
-                    "failure_server_side_grounded_rate",
-                    "failure_net_contact_rate",
-                    "failure_ball_drop_rate",
-                    "failure_out_of_bounds_rate",
-                    "failure_tilt_rate",
-                    "timeout_rate",
-                ):
+                for key in EPISODE_METRIC_KEYS:
                     if key in extras:
                         value = extras[key]
                         if isinstance(value, torch.Tensor):
@@ -331,7 +374,6 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
 
         wandb.log(wandb_metrics, step=int(locs.get("it", 0)))
 
-    # Patch the correct location
     if hasattr(runner, "log"):
         runner.log = _wandb_log
     elif hasattr(runner.logger, "log"):
@@ -339,48 +381,28 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
 
 
 def _patch_runner_log_for_curriculum(runner: OnPolicyRunner, curriculum, freeze_stage: bool = False) -> None:
-    """Patch the runner's logger to trigger curriculum promotion after each iteration.
+    """Patch the runner's log method to trigger curriculum promotion after each iteration.
 
-    The success_rate is extracted from runner.logger.ep_extras buffer, which is populated
-    by Logger.process_env_step() during environment rollouts. The log() method itself
-    does not receive extras/ep_infos as parameters.
-
-    IMPORTANT: We must extract ep_extras BEFORE calling original_log(), because
-    Logger.log() clears ep_extras at the end of its execution.
+    In new rsl-rl (5.0+), episode info is passed via locs["ep_infos"] (list of dicts)
+    inside the log() call, rather than through logger.ep_extras.
     """
     if curriculum is None or freeze_stage:
         return
 
-    # Get the logger object (not the log method)
-    logger_obj = getattr(runner, "logger", None)
-    if logger_obj is None:
-        print("[WARN] Runner has no logger. Iteration-based curriculum promotion disabled.")
-        return
-
     original_log = None
-    patch_target = None
     if hasattr(runner, "log"):
         original_log = runner.log
-        patch_target = "runner"
-    elif hasattr(logger_obj, "log"):
-        original_log = logger_obj.log
-        patch_target = "logger"
+    elif hasattr(runner, "logger") and hasattr(runner.logger, "log"):
+        original_log = runner.logger.log
     else:
-        print("[WARN] Could not find log method for curriculum patching. Iteration-based curriculum promotion disabled.")
+        print("[WARN] Could not find log method for curriculum patching. Disabled.")
         return
 
-    def _extract_iteration_success_rate_from_ep_extras(ep_extras: list) -> float | None:
-        """Extract mean success_rate from ep_extras buffer.
-
-        The ep_extras buffer contains episode-level statistics collected during
-        the rollout via Logger.process_env_step(). Each entry is a dict with
-        keys like 'success_rate', 'curriculum_stage_id', etc.
-        """
-        if not ep_extras or not isinstance(ep_extras, list):
+    def _extract_success_rate_from_ep_infos(ep_infos: list) -> float | None:
+        if not ep_infos or not isinstance(ep_infos, list):
             return None
-
         values: list[float] = []
-        for info in ep_extras:
+        for info in ep_infos:
             if not isinstance(info, dict) or "success_rate" not in info:
                 continue
             value = info["success_rate"]
@@ -390,29 +412,22 @@ def _patch_runner_log_for_curriculum(runner: OnPolicyRunner, curriculum, freeze_
                 values.extend(float(v) for v in value.detach().flatten().cpu().tolist())
             else:
                 values.append(float(value))
-
-        if values:
-            return float(sum(values) / len(values))
-        return None
+        return float(sum(values) / len(values)) if values else None
 
     def _curriculum_log(*args, **kwargs):
-        # CRITICAL: Extract ep_extras BEFORE calling original_log(),
-        # because Logger.log() clears ep_extras at the end!
-        ep_extras_snapshot = list(getattr(logger_obj, "ep_extras", []))
-        iteration_success_rate = _extract_iteration_success_rate_from_ep_extras(ep_extras_snapshot)
+        # Extract success_rate from ep_infos BEFORE calling original_log
+        # (new rsl-rl passes locals() dict as first positional arg)
+        locs = args[0] if args and isinstance(args[0], dict) else kwargs
+        ep_infos = locs.get("ep_infos", [])
+        iteration_success_rate = _extract_success_rate_from_ep_infos(ep_infos)
 
-        # Now call the original log method (which will clear ep_extras)
         result = original_log(*args, **kwargs)
 
-        # Update curriculum with the pre-extracted success rate
         if iteration_success_rate is not None:
             curriculum.update_iteration(iteration_success_rate)
         return result
 
-    if patch_target == "runner":
-        runner.log = _curriculum_log
-    else:
-        logger_obj.log = _curriculum_log
+    runner.log = _curriculum_log
 
 
 def _patch_runner_log_for_task2_product_json(
@@ -422,24 +437,13 @@ def _patch_runner_log_for_task2_product_json(
 ) -> None:
     """Track task2 metrics and append iteration info to JSON when product improves.
 
-    Rule:
-    1) Start tracking only after both metrics are > threshold.
-    2) After that, whenever metric_a * metric_b exceeds previous best product,
-       append this step information to a JSON file.
+    In new rsl-rl (5.0+), episode info is passed via locs["ep_infos"] (list of dicts).
     """
-    logger_obj = getattr(runner, "logger", None)
-    if logger_obj is None:
-        print("[WARN] Runner has no logger. Task2 product JSON tracking disabled.")
-        return
-
     original_log = None
-    patch_target = None
     if hasattr(runner, "log"):
         original_log = runner.log
-        patch_target = "runner"
-    elif hasattr(logger_obj, "log"):
-        original_log = logger_obj.log
-        patch_target = "logger"
+    elif hasattr(runner, "logger") and hasattr(runner.logger, "log"):
+        original_log = runner.logger.log
     else:
         print("[WARN] Could not find log method for task2 product JSON tracking. Disabled.")
         return
@@ -451,11 +455,12 @@ def _patch_runner_log_for_task2_product_json(
     threshold_armed = False
     saved_steps: list[dict[str, float | int]] = []
 
-    def _extract_metric_mean(ep_extras: list, key: str) -> float | None:
-        if not ep_extras:
+    @torch.no_grad()
+    def _extract_metric_mean(ep_infos: list, key: str) -> float | None:
+        if not ep_infos:
             return None
         values: list[float] = []
-        for info in ep_extras:
+        for info in ep_infos:
             if not isinstance(info, dict) or key not in info:
                 continue
             value = info[key]
@@ -465,18 +470,17 @@ def _patch_runner_log_for_task2_product_json(
                 values.extend(float(v) for v in value.detach().flatten().cpu().tolist())
             else:
                 values.append(float(value))
-        if not values:
-            return None
-        return float(sum(values) / len(values))
+        return float(sum(values) / len(values)) if values else None
 
     def _task2_product_log(*args, **kwargs):
         nonlocal best_product, threshold_armed, saved_steps
 
-        # Must snapshot before original log clears ep_extras.
-        ep_extras_snapshot = list(getattr(logger_obj, "ep_extras", []))
-        metric_a = _extract_metric_mean(ep_extras_snapshot, metric_a_key)
-        metric_b = _extract_metric_mean(ep_extras_snapshot, metric_b_key)
-        iteration = kwargs.get("it", getattr(runner, "current_learning_iteration", 0))
+        # Extract ep_infos from the locs dict (new rsl-rl: first positional arg)
+        locs = args[0] if args and isinstance(args[0], dict) else kwargs
+        ep_infos = locs.get("ep_infos", [])
+        metric_a = _extract_metric_mean(ep_infos, metric_a_key)
+        metric_b = _extract_metric_mean(ep_infos, metric_b_key)
+        iteration = locs.get("it", getattr(runner, "current_learning_iteration", 0))
 
         result = original_log(*args, **kwargs)
 
@@ -518,10 +522,10 @@ def _patch_runner_log_for_task2_product_json(
             )
         return result
 
-    if patch_target == "runner":
+    if hasattr(runner, "log"):
         runner.log = _task2_product_log
     else:
-        logger_obj.log = _task2_product_log
+        runner.logger.log = _task2_product_log
 
 
 def _save_curriculum_summary(runner: OnPolicyRunner, log_dir: str) -> None:
