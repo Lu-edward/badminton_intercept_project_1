@@ -280,6 +280,20 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
         "wrong_hit_rate",
         "num_resets",
         "curriculum_stage_id",
+        "post_hit_net_contact_rate",
+        "post_hit_drone_net_collision_rate",
+        "post_hit_ball_too_high_rate",
+        "post_hit_drone_half_grounded_rate",
+        "post_hit_server_half_grounded_rate",
+        "post_hit_drone_half_out_rate",
+        "post_hit_server_half_out_rate",
+        "pre_hit_success_hit_rate",
+        "pre_hit_failure_net_contact_rate",
+        "pre_hit_failure_server_side_grounded_rate",
+        "pre_hit_failure_ball_drop_rate",
+        "pre_hit_failure_out_of_bounds_rate",
+        "pre_hit_failure_tilt_rate",
+        "pre_hit_timeout_rate",
         "failure_server_side_grounded",
         "failure_server_side_grounded_rate",
         "failure_net_contact_rate",
@@ -295,23 +309,46 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
             return args[0]
         return kwargs
 
+    def _numeric_values(value: Any) -> list[float]:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return [float(v) for v in value.detach().float().flatten().cpu().tolist()]
+        if isinstance(value, (int, float)):
+            return [float(value)]
+        return []
+
     def _extract_episode_metrics(ep_infos: list) -> dict[str, float]:
-        if not ep_infos or not ep_infos[0]:
+        if not ep_infos:
             return {}
+        keys = {
+            key
+            for ep_info in ep_infos
+            if isinstance(ep_info, dict)
+            for key in ep_info
+        }
         result: dict[str, float] = {}
-        for key in ep_infos[0]:
+        for key in keys:
             values: list[float] = []
             for ep_info in ep_infos:
+                if not isinstance(ep_info, dict):
+                    continue
                 if key not in ep_info:
                     continue
-                val = ep_info[key]
-                if isinstance(val, torch.Tensor):
-                    if val.numel() == 1:
-                        values.append(float(val.item()))
-                    elif val.numel() > 1:
-                        values.append(float(val.float().mean().item()))
-                elif isinstance(val, (int, float)):
-                    values.append(float(val))
+                values.extend(_numeric_values(ep_info[key]))
+            if values:
+                result[key] = float(sum(values) / len(values))
+        return result
+
+    def _extract_episode_metrics_from_extras(extras: dict) -> dict[str, float]:
+        episode_data = extras.get("episode", extras.get("log", extras))
+        if not isinstance(episode_data, dict):
+            return {}
+        result: dict[str, float] = {}
+        for key in EPISODE_METRIC_KEYS:
+            if key not in episode_data:
+                continue
+            values = _numeric_values(episode_data[key])
             if values:
                 result[key] = float(sum(values) / len(values))
         return result
@@ -331,7 +368,7 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
 
         wandb_metrics: dict[str, float] = {
             "iteration": float(locs.get("it", 0)),
-            "collect_time": float(locs.get("collect_time", 0)),
+            "collect_time": float(locs.get("collect_time", locs.get("collection_time", 0))),
             "learn_time": float(locs.get("learn_time", 0)),
             "Policy/mean_noise_std": mean_std,
         }
@@ -365,12 +402,8 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
         elif locs.get("extras"):
             extras = locs["extras"]
             if isinstance(extras, dict):
-                for key in EPISODE_METRIC_KEYS:
-                    if key in extras:
-                        value = extras[key]
-                        if isinstance(value, torch.Tensor):
-                            value = value.item()
-                        wandb_metrics[f"Episode/{key}"] = float(value)
+                for key, value in _extract_episode_metrics_from_extras(extras).items():
+                    wandb_metrics[f"Episode/{key}"] = value
 
         wandb.log(wandb_metrics, step=int(locs.get("it", 0)))
         if int(locs.get("it", 0)) % 100 == 0:

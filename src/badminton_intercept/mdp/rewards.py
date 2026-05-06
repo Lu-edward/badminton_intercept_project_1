@@ -209,7 +209,7 @@ def compute_rewards_task2(
     episode_length_buf=None,
     max_episode_length=None,
     has_hit_ball=None,
-    c_hit: float = 50.0,
+    c_hit: float = 100.0,
     c_center: float = 5.0,
     lambda_c: float = 5.0,
     c_pos: float = 5.0,
@@ -320,7 +320,7 @@ def compute_rewards_task2(
         drone_up_w_norm = torch.linalg.norm(drone_up_w, dim=-1, keepdim=True).clamp(min=1e-8)
         drone_up_w_unit = drone_up_w / drone_up_w_norm
         post_tilt = drone_up_w_unit[:, 2]
-        r_tilt = pre_tilt * pre_hit_mask.float() * pre_hit_mask + post_tilt * has_hit_ball.float() * pre_hit_mask
+        r_tilt = pre_tilt * pre_hit_mask.float() * 0 + post_tilt * has_hit_ball.float() * 0
 
     if drone_ang_vel_w is None:
         r_ang = torch.zeros(batch_size, device=device)
