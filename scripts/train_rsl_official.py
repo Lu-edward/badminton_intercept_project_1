@@ -354,8 +354,17 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
         return result
 
     def _wandb_log(*args, **kwargs) -> None:
-        original_log(*args, **kwargs)
         locs = _resolve_locs(*args, **kwargs)
+        episode_metrics: dict[str, float] = {}
+        ep_infos = locs.get("ep_infos")
+        if ep_infos and isinstance(ep_infos, list):
+            episode_metrics = _extract_episode_metrics(ep_infos)
+        elif locs.get("extras"):
+            extras = locs["extras"]
+            if isinstance(extras, dict):
+                episode_metrics = _extract_episode_metrics_from_extras(extras)
+
+        original_log(*args, **kwargs)
         policy = _get_runner_policy(runner)
 
         mean_std = 0.0
@@ -394,20 +403,12 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
         elif locs.get("mean_episode_length") is not None:
             wandb_metrics["Train/mean_episode_length"] = float(locs["mean_episode_length"])
 
-        # Episode/* metrics: new rsl-rl uses ep_infos list, old uses extras dict
-        ep_infos = locs.get("ep_infos")
-        if ep_infos and isinstance(ep_infos, list):
-            for key, value in _extract_episode_metrics(ep_infos).items():
-                wandb_metrics[f"Episode/{key}"] = value
-        elif locs.get("extras"):
-            extras = locs["extras"]
-            if isinstance(extras, dict):
-                for key, value in _extract_episode_metrics_from_extras(extras).items():
-                    wandb_metrics[f"Episode/{key}"] = value
+        for key, value in episode_metrics.items():
+            wandb_metrics[f"Episode/{key}"] = value
 
         wandb.log(wandb_metrics, step=int(locs.get("it", 0)))
-        if int(locs.get("it", 0)) % 100 == 0:
-            epi_keys = [k for k in wandb_metrics if k.startswith("Episode/")]
+        epi_keys = [k for k in wandb_metrics if k.startswith("Episode/")]
+        if epi_keys or int(locs.get("it", 0)) % 100 == 0:
             train_keys = [k for k in wandb_metrics if k.startswith("Train/")]
             loss_keys = [k for k in wandb_metrics if k.startswith("Loss/")]
             print(f"[wandb] step={locs.get('it')} | Train keys: {train_keys} | Loss keys: {loss_keys} | Episode keys: {epi_keys}")
