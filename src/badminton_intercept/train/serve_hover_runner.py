@@ -5,6 +5,7 @@ import inspect
 import pkgutil
 from typing import Any
 
+import rsl_rl
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -1044,6 +1045,7 @@ class ServeHoverOnPolicyRunner(OnPolicyRunner):
         self.env = env
         self.cfg = train_cfg
         self.device = device
+        self.log_dir = log_dir
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -1066,6 +1068,13 @@ class ServeHoverOnPolicyRunner(OnPolicyRunner):
         )
 
         self.current_learning_iteration = 0
+        self.writer = None
+        self.tot_timesteps = 0
+        self.tot_time = 0
+        self.git_status_repos = [rsl_rl.__file__]
+        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0 if hasattr(self, "is_distributed") else False
+        self.num_steps_per_env = self.cfg.get("num_steps_per_env", 24)
+        self.save_interval = self.cfg.get("save_interval", 500)
 
     def _get_alg_policy(self) -> ServeHoverDualActorCritic:
         # First check if we stored the policy directly

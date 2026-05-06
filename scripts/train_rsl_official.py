@@ -373,6 +373,11 @@ def _patch_runner_log_for_wandb(runner: OnPolicyRunner) -> None:
                         wandb_metrics[f"Episode/{key}"] = float(value)
 
         wandb.log(wandb_metrics, step=int(locs.get("it", 0)))
+        if int(locs.get("it", 0)) % 100 == 0:
+            epi_keys = [k for k in wandb_metrics if k.startswith("Episode/")]
+            train_keys = [k for k in wandb_metrics if k.startswith("Train/")]
+            loss_keys = [k for k in wandb_metrics if k.startswith("Loss/")]
+            print(f"[wandb] step={locs.get('it')} | Train keys: {train_keys} | Loss keys: {loss_keys} | Episode keys: {epi_keys}")
 
     if hasattr(runner, "log"):
         runner.log = _wandb_log

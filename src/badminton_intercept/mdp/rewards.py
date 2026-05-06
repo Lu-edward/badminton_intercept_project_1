@@ -257,6 +257,7 @@ def compute_rewards_task2(
     contact_f = contact.float()
     batch_size = racket_pos_w.shape[0]
     device = racket_pos_w.device
+    pre_hit_mask = ~has_hit_ball
 
     if has_hit_ball is None:
         has_hit_ball = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -286,13 +287,13 @@ def compute_rewards_task2(
 
     drone_target = torch.tensor(drone_target_pos, dtype=racket_pos_w.dtype, device=device)
     dist_drone_target = torch.linalg.norm(drone_pos_w - drone_target, dim=-1) if drone_pos_w is not None else torch.zeros(batch_size, device=device)
-    r_drone_pos = c_drone_pos / (1.0 + dist_drone_target) * has_hit_ball.float() 
+    r_drone_pos = c_drone_pos / (1.0 + dist_drone_target) * has_hit_ball.float() * pre_hit_mask
     
 
     # ── Phase 3: 通用（仅 pre-hit 阶段生效，post-hit 阶段全部归零） ──
-    pre_hit_mask = ~has_hit_ball
 
-    r_x_boundary = -100.0 * (drone_pos_w[:, 0] < 0.15).float()  if drone_pos_w is not None else torch.zeros(batch_size, device=device)
+
+    r_x_boundary = -100.0 * (drone_pos_w[:, 0] < 0.15).float() * pre_hit_mask if drone_pos_w is not None else torch.zeros(batch_size, device=device)
 
     if action is None or prev_action is None:
         r_smooth = torch.zeros(batch_size, device=device)
@@ -303,12 +304,12 @@ def compute_rewards_task2(
     if yaw is None:
         r_spin = torch.zeros(batch_size, device=device)
     else:
-        r_spin = -c_spin * torch.abs(yaw) 
+        r_spin = -c_spin * torch.abs(yaw) * pre_hit_mask
 
     if bound_dist is None:
         r_bound = torch.zeros(batch_size, device=device)
     else:
-        r_bound = -c_bound * bound_dist 
+        r_bound = -c_bound * bound_dist * pre_hit_mask
 
     if drone_up_w is None:
         r_tilt = torch.zeros(batch_size, device=device)
@@ -319,12 +320,12 @@ def compute_rewards_task2(
         drone_up_w_norm = torch.linalg.norm(drone_up_w, dim=-1, keepdim=True).clamp(min=1e-8)
         drone_up_w_unit = drone_up_w / drone_up_w_norm
         post_tilt = drone_up_w_unit[:, 2]
-        r_tilt = pre_tilt * pre_hit_mask.float() + post_tilt * has_hit_ball.float()
+        r_tilt = pre_tilt * pre_hit_mask.float() * pre_hit_mask + post_tilt * has_hit_ball.float() * pre_hit_mask
 
     if drone_ang_vel_w is None:
         r_ang = torch.zeros(batch_size, device=device)
     else:
-        r_ang = -c_ang_vel * torch.linalg.norm(drone_ang_vel_w, dim=-1) 
+        r_ang = -c_ang_vel * torch.linalg.norm(drone_ang_vel_w, dim=-1) * pre_hit_mask
 
     # 位置追踪奖励（仅 pre-hit 阶段生效）
     d_3d = torch.linalg.norm(ball_pos_w - racket_pos_w, dim=-1)

@@ -192,7 +192,7 @@ class InterceptEnvRuntimeMixin:
         ):
             return self._drone.data.body_pos_w[:, self._racket_body_ids, :].mean(dim=1)
 
-        offset_z = float(getattr(self.cfg, "racket_offset_z_m", 0.2))
+        offset_z = float(getattr(self.cfg, "racket_offset_z_m", 0.1))
         racket_pos = drone_pos_w.clone()
         racket_pos[:, 2] += offset_z
         return racket_pos
