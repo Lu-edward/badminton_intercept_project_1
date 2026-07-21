@@ -14,6 +14,16 @@ logs/
 .claude/
 .codex/
 wandb/
+reports/
+reports.zip
+
+# dev leftovers / generated artifacts
+IMPLEMENTATION_FRAMEWORK.md
+visual_test_log.txt
+.warp_cache/
+.tmp_hit_plane_library/
+.asset_hash
+*.bak
 
 AGENTS.md
 
